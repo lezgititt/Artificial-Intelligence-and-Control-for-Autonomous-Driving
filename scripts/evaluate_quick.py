@@ -19,6 +19,7 @@ import numpy as np
 from scripts.evaluate import OUTCOMES, _plot_training_panels, _summarize, plt
 from matplotlib.colors import BoundaryNorm, ListedColormap
 from matplotlib.patches import Patch
+from matplotlib.lines import Line2D
 
 from algorithms.ppo import PPO
 from env import road_builder
@@ -34,7 +35,7 @@ TICKS = tuple(range(2, 250, 5))
 STEP = 0.5
 
 
-def _evaluate_worker(model, config, work, saved, vph, cases):
+def _evaluate_worker(model, config, work, saved, vph, cases, depart_lane=None):
     import torch
 
     torch.set_num_threads(1)
@@ -45,7 +46,7 @@ def _evaluate_worker(model, config, work, saved, vph, cases):
                   mdp_sim=mdp["SIMULATION"], mdp_obs=mdp["OBSERVATION"],
                   action=mdp["ACTION"], reward=train["REWARD"], traffic=road["TRAFFIC"])
     env = ParallelSumo(len(cases), kwargs, work, seed=0, randomize_signals=True,
-                       randomize_departures=saved.get("randomize_departures", False),
+                       randomize_departures=depart_lane is not None or saved.get("randomize_departures", False),
                        independent_episode_rng=saved.get("independent_episode_rng", False),
                        traffic_curriculum=curriculum,
                        fixed_traffic_vph=vph if curriculum else None)
@@ -54,6 +55,13 @@ def _evaluate_worker(model, config, work, saved, vph, cases):
     agent = PPO(obs_dim=env.prototype.obs_dim, act_dim=env.prototype.act_dim,
                 **(train["HPARAMS"] | {"device": "cpu"}))
     agent.policy.load_state_dict(torch.load(model, map_location="cpu", weights_only=True))
+    if depart_lane is not None:
+        env._find_departures()
+        for route in {route for _, route, _ in cases}:
+            lanes = tuple(item for item in env.departures[route] if item[2] == depart_lane)
+            if not lanes:
+                raise ValueError(f"{route}: unavailable departure lane {depart_lane}")
+            env.departures[route] = lanes
     rows = evaluate_parallel_routes(
         agent.policy, env, agent.device, [route for _, route, _ in cases],
         signal_ticks=[tick for _, _, tick in cases],
@@ -62,50 +70,73 @@ def _evaluate_worker(model, config, work, saved, vph, cases):
     return [{"route": route, **row} for (_, route, _), row in zip(cases, rows, strict=True)]
 
 
-def _red_wait_stats(rows):
-    distances = [row["red_wait_clearance_m"] for row in rows
-                 if row["red_wait_clearance_m"] is not None]
-    if not distances:
-        return dict(n=0, mean_m=None, median_m=None, q1_m=None, q3_m=None)
-    q1, median, q3 = np.percentile(distances, [25, 50, 75]).tolist()
-    return dict(n=len(distances), mean_m=float(np.mean(distances)), median_m=median,
-                q1_m=q1, q3_m=q3)
+CLEARANCE_COLUMNS = (
+    ("min_m", "Min"), ("q10_m", "P10"), ("q1_m", "Q1"),
+    ("median_m", "Median"), ("q3_m", "Q3"), ("q90_m", "P90"),
+    ("max_m", "Max"), ("mean_m", "Mean"), ("n", "n"),
+)
 
 
-def _plot_clearances(axis, routes, summary):
-    axis.set_title("Red-light waiting clearance (m)", pad=28)
-    axis.set_xlim(-.5, 4.5)
-    axis.set_xticks([])
-    axis.tick_params(axis="y", left=False, labelleft=False)
-    columns = ("Mean", "Median", "Q1", "Q3", "n")
-    for i, label in enumerate(columns):
-        axis.text(i, 1.01, label, transform=axis.get_xaxis_transform(),
-                  ha="center", va="bottom", weight="bold", fontsize=8)
-    for y, route in enumerate(routes):
-        stats = summary["by_route"][route]["red_wait_clearance"]
-        if y % 2 == 0:
-            axis.axhspan(y - .5, y + .5, color="#f2f4f7", zorder=0)
-        for i, key in enumerate(("mean_m", "median_m", "q1_m", "q3_m", "n")):
+def _red_wait_stats(rows, field="red_wait_clearance_m"):
+    distances = [row[field] for row in rows if row[field] is not None]
+    stats = {key: None for key, _ in CLEARANCE_COLUMNS}
+    stats["n"] = len(distances)
+    if distances:
+        quantile_keys = [key for key, _ in CLEARANCE_COLUMNS[:7]]
+        stats.update(zip(quantile_keys, np.percentile(distances, [0, 10, 25, 50, 75, 90, 100]).tolist()))
+        stats["mean_m"] = float(np.mean(distances))
+    return stats
+
+
+def _plot_clearances(table, distribution, routes, summary):
+    table.set_title("Red-light waiting clearance (m)", pad=28)
+    table.set_xlim(-.5, len(CLEARANCE_COLUMNS) - .5)
+    table.set_xticks([])
+    for axis in (table, distribution):
+        axis.tick_params(axis="y", left=False, labelleft=False)
+    for x, (_, label) in enumerate(CLEARANCE_COLUMNS):
+        table.text(x, 1.01, label, transform=table.get_xaxis_transform(),
+                   ha="center", va="bottom", weight="bold", fontsize=8)
+
+    by_route = [summary["by_route"][route]["red_wait_clearance"] for route in routes]
+    all_stats = summary["all"]["red_wait_clearance"]
+    distribution.set(title="Clearance distribution", xlabel="Distance (m)",
+                     xlim=(0, max(1.0, (all_stats["max_m"] or 0.0) * 1.05)))
+    distribution.grid(axis="x", alpha=.2)
+    distribution.set_axisbelow(True)
+    for y, stats in enumerate([*by_route, all_stats]):
+        if y % 2 == 0 or y == len(routes):
+            for axis in (table, distribution):
+                axis.axhspan(y - .5, y + .5, color="#e2e8f0" if y == len(routes) else "#f2f4f7",
+                            zorder=0)
+        for x, (key, _) in enumerate(CLEARANCE_COLUMNS):
             value = stats[key]
             label = str(value) if key == "n" else ("—" if value is None else f"{value:.1f}")
-            axis.text(i, y, label, ha="center", va="center", fontsize=8)
-    stats = summary["all"]["red_wait_clearance"]
-    values = [stats[k] for k in ("mean_m", "median_m", "q1_m", "q3_m")]
-    totals = "  |  ".join(f"{label} {value:.1f}" for label, value in zip(columns, values)
-                        if value is not None)
-    axis.set_xlabel(f"All routes (n={stats['n']})\n{totals or 'No red-light stops'}",
-                    fontsize=9, labelpad=8)
+            table.text(x, y, label, ha="center", va="center", fontsize=8)
+        if stats["n"]:
+            distribution.hlines(y, stats["min_m"], stats["max_m"], color="#64748b", linewidth=1)
+            distribution.hlines(y, stats["q10_m"], stats["q90_m"], color="#60a5fa", linewidth=3)
+            distribution.hlines(y, stats["q1_m"], stats["q3_m"], color="#2563eb", linewidth=6)
+            distribution.scatter(stats["median_m"], y, marker="D", s=19,
+                                 color="#172554", edgecolors="white", linewidths=.6, zorder=4)
+    distribution.legend(handles=[
+        Line2D([], [], color="#64748b", label="Min–Max"),
+        Line2D([], [], color="#60a5fa", linewidth=3, label="P10–P90"),
+        Line2D([], [], color="#2563eb", linewidth=6, label="Q1–Q3"),
+        Line2D([], [], color="#172554", marker="D", linestyle="none", label="Median"),
+    ], ncol=2, fontsize=8, loc="upper center", bbox_to_anchor=(.5, -.10), frameon=False)
 
 
 def _plot(run, out, routes, rows, summary):
-    fig = plt.figure(figsize=(18, 16), layout="constrained")
+    fig = plt.figure(figsize=(23, 16), layout="constrained")
     grid = fig.add_gridspec(4, 2, height_ratios=(1, 1, 1, 3.3))
     _plot_training_panels(fig, grid, run)
-    final = grid[3, :].subgridspec(1, 3, width_ratios=(1.0, 1.75, 1.05))
+    final = grid[3, :].subgridspec(1, 4, width_ratios=(1.0, 1.75, 1.75, 1.35))
     rates = fig.add_subplot(final[0, 0])
     offsets = fig.add_subplot(final[0, 1], sharey=rates)
     clearance = fig.add_subplot(final[0, 2], sharey=rates)
-    _plot_clearances(clearance, routes, summary)
+    distribution = fig.add_subplot(final[0, 3], sharey=rates)
+    _plot_clearances(clearance, distribution, routes, summary)
     labels = [route.removeprefix("ego_d_").replace("ego_r_RING_", "Ring ") for route in routes]
     counts = {route: Counter() for route in routes}
     for row in rows:
@@ -122,7 +153,7 @@ def _plot(run, out, routes, rows, summary):
     rates.set(xlim=(0, len(TICKS) + 10), title="Final outcomes by route",
               xlabel="Episodes (one per signal offset)")
     rates.set_xticks(range(0, len(TICKS) + 1, 10))
-    rates.set_yticks(y, labels, fontsize=8)
+    rates.set_yticks(np.arange(len(routes) + 1), [*labels, "All routes"], fontsize=8)
     rates.grid(axis="x", alpha=.2)
     rates.set_axisbelow(True)
 
@@ -136,15 +167,15 @@ def _plot(run, out, routes, rows, summary):
                    interpolation="nearest", aspect="auto",
                    extent=(TICKS[0] * STEP - spacing / 2, TICKS[-1] * STEP + spacing / 2,
                            len(routes) - .5, -.5))
-    offsets.set(xlim=(0, 125), ylim=(len(routes) - .5, -.5),
+    offsets.set(xlim=(0, 125), ylim=(len(routes) + .5, -.5),
                 title="Final outcome by route and signal start",
                 xlabel="Signal offset at episode start (s)")
     offsets.set_xticks(np.arange(0, 126, 12.5))
     offsets.tick_params(axis="y", left=False, labelleft=False)
     for boundary in np.arange(.5, len(routes) - .5, 1):
         offsets.axhline(boundary, color="white", linewidth=.35, alpha=.7)
-    for axis in (rates, offsets, clearance):
-        axis.axhline(21.5, color="#374151", linewidth=.8)
+    for axis in (rates, offsets, clearance, distribution):
+        axis.axhline(len(routes) - .5, color="#374151", linewidth=.8)
     handles = [Patch(color=color, label=label) for label, _, color in OUTCOMES.values()]
     offsets.legend(handles=handles, ncol=3, fontsize=8, loc="upper center",
                    bbox_to_anchor=(.5, -.10), frameon=False)
@@ -162,6 +193,8 @@ def main():
     parser.add_argument("run", type=Path, help="학습 결과 폴더 또는 model.pt")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--traffic-vph", type=int, help="배경 교통이 있는 모델의 고정 중앙 투입량")
+    parser.add_argument("--a2-ring-lane-sweep", action="store_true",
+                        help="A2→A4 Ring 출발 차선별로 신호 시작 시점 50개를 추가 평가")
     args = parser.parse_args()
     run = args.run.resolve()
     if run.is_file() and run.name == "model.pt":
@@ -198,6 +231,12 @@ def main():
                                 [(j, route, int(tick)) for j, route in enumerate(routes) for tick in chunk])
                     for i, chunk in enumerate(chunks)]
             rows = [row for job in jobs for row in job.result()]
+            if args.a2_ring_lane_sweep:
+                route = "ego_r_RING_A2_A4_A2_A4"
+                cases = [(routes.index(route), route, tick) for tick in TICKS]
+                lane_jobs = [pool.submit(_evaluate_worker, model, config, root / f"lane_{lane}",
+                                         saved, vph, cases, lane) for lane in range(4)]
+                lane_rows = [row for job in lane_jobs for row in job.result()]
     rows.sort(key=lambda row: (row["route"], row["signal_offset_s"]))
     out = run / "analysis" / ("quick" if args.traffic_vph is None else f"quick_traffic_{vph}")
     out.mkdir(parents=True, exist_ok=True)
@@ -206,8 +245,21 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
     def summarize(group):
-        return {**_summarize(group), "red_wait_clearance": _red_wait_stats(group)}
+        green = [row["green_restart_delay_s"] for row in group if row["green_restart_observed"]]
+        restarted = [delay for delay in green if delay is not None]
+        return {**_summarize(group), "red_wait_clearance": _red_wait_stats(group),
+                "first_signal_stop_clearance": _red_wait_stats(group, "first_signal_stop_clearance_m"),
+                "green_restart": {
+                    "observed": len(green), "no_restart": len(green) - len(restarted),
+                    "median_delay_s": float(np.median(restarted)) if restarted else None,
+                    "p90_delay_s": float(np.percentile(restarted, 90)) if restarted else None,
+                }}
 
+    if args.a2_ring_lane_sweep:
+        with (out / "a2_ring_lane_evaluation.csv").open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=list(lane_rows[0]))
+            writer.writeheader()
+            writer.writerows(lane_rows)
     summary = {
         "model_sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
         "phase": saved.get("phase"),
@@ -218,10 +270,20 @@ def main():
         "signal_offsets_s": [tick * STEP for tick in TICKS],
         "red_wait_definition": "Last measurable stop per episode with speed <= 0.5 m/s "
                                "and nearest observed signal red; nearest stop line or stopped leader.",
+        "first_signal_stop_definition": "First measurable stop per episode with speed <= 0.5 m/s "
+                                        "and nearest observed signal yellow or red.",
+        "green_restart_definition": "From the first observed green for the same signal link after a red stop "
+                                    "(speed <= 0.5 m/s), count time until speed exceeds 0.5 m/s or green is crossed. "
+                                    "No restart if the green window, signal observation, or episode ends first.",
         "all": summarize(rows),
         "by_route": {route: summarize([row for row in rows if row["route"] == route])
                      for route in routes},
     }
+    if args.a2_ring_lane_sweep:
+        summary["a2_ring_by_start_lane"] = {
+            str(lane): summarize([row for row in lane_rows if row["start_lane"] == lane])
+            for lane in range(4)
+        }
     _plot(run, out, routes, rows, summary)
     summary["elapsed_seconds"] = round(perf_counter() - start, 2)
     (out / "evaluation_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

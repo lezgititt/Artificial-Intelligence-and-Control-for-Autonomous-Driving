@@ -182,8 +182,14 @@ class SumoHighwayEnv(gym.Env):
                                                  -self.connectivity_half_width - 1, -1))
         # 누락된 키는 False: 기존 저장 모델의 관측 레이아웃을 유지한다.
         self.lookahead_connectivity_enabled = bool(mdp_obs.get("lookahead_connectivity_enabled", False))
+        self.lookahead_edges = int(mdp_obs.get("lookahead_edges", 2))
+        self.junction_lane_reference = bool(mdp_obs.get("junction_lane_reference", False))
         # 연결 차선 ID는 정적 정보다. 신호색/진입 가능 시점은 캐시하지 않는다.
         self._lane_successors_cache = {}
+        self._early_lane_plan_cache = {}
+        self._lane_change_margin_plan_cache = {}
+        self._early_lane_best = {}
+        self._early_lane_units_paid = {}
         self.destination_enabled = bool(mdp_obs.get("destination_enabled", False))
         self.destination_arms = tuple(mdp_obs.get("destination_arms", ("A1", "A2", "A3", "A4", "A5")))
         if self.destination_enabled and (not self.destination_arms
@@ -252,9 +258,15 @@ class SumoHighwayEnv(gym.Env):
         self.obs_offsets = (+2, +1, 0, -1, -2)
         n_lanes_view = len(self.obs_offsets)
         self.obs_dim = 1 + n_lanes_view * 4 + len(self.connectivity_offsets) + n_lanes_view
-        self.obs_dim += 5 * self.signal_count if self.signal_enabled else 0
+        self.signal_fine_distance_scale = float(mdp_obs.get("signal_fine_distance_scale", 0.0))
+        signal_obs_size = 5 + int(self.signal_fine_distance_scale > 0)
+        self.obs_dim += signal_obs_size * self.signal_count if self.signal_enabled else 0
         self.obs_dim += len(self.connectivity_offsets) if self.lookahead_connectivity_enabled else 0
         self.obs_dim += len(self.destination_arms) if self.destination_enabled else 0
+        self.lane_decision_distance_scale = float(mdp_obs.get("lane_decision_distance_scale", 0.0))
+        self.lane_change_margin_scale = float(mdp_obs.get("lane_change_margin_scale", 0.0))
+        self.obs_dim += int(self.lane_decision_distance_scale > 0)
+        self.obs_dim += int(self.lane_change_margin_scale > 0)
         self.observation_space = spaces.Box(-1.0, 1.0, shape=(self.obs_dim,),
                                             dtype=np.float32)
 
@@ -398,6 +410,9 @@ class SumoHighwayEnv(gym.Env):
         self._green_stop_since = None
         self._red_safe_zone_since = None
         self._red_safe_zone_hold_paid = {}
+        self._yellow_tracking_plan = None
+        self._early_lane_best = {}
+        self._early_lane_units_paid = {}
         if depart_lane is None:
             start_edge = self._api.route.getEdges(route_id)[0]
             depart_lane = self._depart_lane_for(start_edge)
@@ -498,10 +513,12 @@ class SumoHighwayEnv(gym.Env):
             return None
         return float(gap), self._api.vehicle.getSpeed(vid)
 
-    def _lane_follows_route(self, lane_id) -> bool:
+    def _lane_follows_route(self, lane_id, *, reference_edge=None) -> bool:
         """이 차선이 ego 경로의 '다음 도로'로 이어지면 True."""
         route = self._api.vehicle.getRoute(self.ego_id)
         idx = self._api.vehicle.getRouteIndex(self.ego_id)
+        if reference_edge is not None and 0 <= idx < len(route) - 1 and route[idx + 1] == reference_edge:
+            idx += 1
         if idx < 0 or idx + 1 >= len(route):
             return True                       # 마지막 도로: 어느 차선이든 도착
         next_edge = route[idx + 1]
@@ -524,6 +541,24 @@ class SumoHighwayEnv(gym.Env):
         except self._api.TraCIException:
             return False
 
+    def _lane_observation_reference(self):
+        """Use the outgoing ordinary lane as the reference inside a junction."""
+        lane = self._api.vehicle.getLaneID(self.ego_id)
+        position = self._api.vehicle.getLanePosition(self.ego_id)
+        if not lane.startswith(":"):
+            return self._api.lane.getEdgeID(lane), self._api.vehicle.getLaneIndex(self.ego_id), position
+        remaining = self._api.lane.getLength(lane) - position
+        for _ in range(8):
+            links = self._api.lane.getLinks(lane)
+            if not links:
+                return None
+            lane = links[0][0]
+            if not lane.startswith(":"):
+                edge = self._api.lane.getEdgeID(lane)
+                return edge, int(lane.rsplit("_", 1)[1]), -remaining
+            remaining += self._api.lane.getLength(lane)
+        return None
+
     def _lane_connectivity(self, offset: int) -> float:
         """오프셋 차선의 '끊김 정도'를 반환.
 
@@ -538,17 +573,24 @@ class SumoHighwayEnv(gym.Env):
         """
         try:
             edge = self._api.vehicle.getRoadID(self.ego_id)
-            if edge.startswith(":"):          # 교차로(junction) 내부 통과 중
-                return 1.0
-            lane_index = self._api.vehicle.getLaneIndex(self.ego_id) + offset
+            reference_edge = None
+            if edge.startswith(":"):
+                reference = self._lane_observation_reference() if self.junction_lane_reference else None
+                if reference is None:
+                    return 1.0
+                edge, index, position = reference
+                reference_edge = edge
+            else:
+                index = self._api.vehicle.getLaneIndex(self.ego_id)
+                position = self._api.vehicle.getLanePosition(self.ego_id)
+            lane_index = index + offset
             if lane_index < 0 or lane_index >= self._api.edge.getLaneNumber(edge):
                 return -1.0                   # 그런 차선이 없음
             lane_id = f"{edge}_{lane_index}"
-            remaining = (self._api.lane.getLength(lane_id)
-                         - self._api.vehicle.getLanePosition(self.ego_id))
+            remaining = self._api.lane.getLength(lane_id) - position
             if remaining > self.visibility:
                 return 1.0                    # 시야 내에선 계속 이어짐
-            if self._lane_follows_route(lane_id):
+            if self._lane_follows_route(lane_id, reference_edge=reference_edge):
                 return 1.0                    # edge가 끝나도 내 경로의 다음 도로로 연결됨
             return float(np.clip(remaining / self.visibility, 0.0, 1.0))
         except self._api.TraCIException:
@@ -578,8 +620,125 @@ class SumoHighwayEnv(gym.Env):
                     pending.append(next_lane)
         return result
 
+    def _lane_decision_context(self):
+        """Find the first route transition that restricts the usable lanes."""
+        api = self._api
+        edge = api.vehicle.getRoadID(self.ego_id)
+        if edge.startswith(":"):
+            return None
+        route = tuple(api.vehicle.getRoute(self.ego_id))
+        index = api.vehicle.getRouteIndex(self.ego_id)
+        if not 0 <= index < len(route) or route[index] != edge:
+            return None
+        key = (route, index)
+        if key not in self._early_lane_plan_cache:
+            lanes = {i: {f"{edge}_{i}"} for i in range(api.edge.getLaneNumber(edge))}
+            lane_count = len(lanes)
+            plan = None
+            for target in range(index + 1, min(len(route), index + 1 + self.lookahead_edges)):
+                lanes = {i: reachable for i, sources in lanes.items()
+                         if (reachable := {b for a in sources
+                                           for b in self._route_successor_lanes(a, route[target])})}
+                if len(lanes) < lane_count:
+                    if lanes:
+                        plan = target, tuple(lanes)
+                    break
+            self._early_lane_plan_cache[key] = plan
+        plan = self._early_lane_plan_cache[key]
+        return (route, index, *plan) if plan is not None else None
+
+    def _early_lane_change_context(self):
+        context = self._lane_decision_context()
+        if context is not None:
+            route, index, target, lanes = context
+            # Only pay on a preparation road, not at the restrictive exit itself.
+            if target >= index + 2:
+                return route[index], target, lanes
+        return None
+
+    def _lane_decision_distance_observation(self, context):
+        if context is None:
+            return 1.0
+        route, _, target, _ = context
+        # Use the end of the road just before the restrictive transition,
+        # even when the ego is still on an earlier road or in the wrong lane.
+        exit_edge = route[target - 1]
+        exit_pos = self._api.lane.getLength(f"{exit_edge}_0")
+        distance = self._api.vehicle.getDrivingDistance(self.ego_id, exit_edge, exit_pos)
+        if distance < 0.0:
+            return 1.0
+        return min(distance / self.lane_decision_distance_scale, 1.0)
+
+    def _lane_change_margin_plan(self, route, index, target, valid_lanes):
+        """Estimate available distance and shifts needed if we keep our lane now."""
+        api = self._api
+        edge = route[index]
+        n_lanes = api.edge.getLaneNumber(edge)
+        if target == index + 1:
+            # The branch is on this road. Start counting at the ego's position.
+            return tuple((api.lane.getLength(f"{edge}_{i}"),
+                          min(abs(i - goal) for goal in valid_lanes))
+                         for i in range(n_lanes))
+
+        next_edge = route[index + 1]
+        next_goals = []
+        for i in range(api.edge.getLaneNumber(next_edge)):
+            reachable = {f"{next_edge}_{i}"}
+            for successor in route[index + 2:target + 1]:
+                reachable = {b for a in reachable
+                             for b in self._route_successor_lanes(a, successor)}
+                if not reachable:
+                    break
+            if reachable:
+                next_goals.append(i)
+        # Count usable road sections after entry; internal junctions cannot be
+        # used for commanded lane changes.
+        room = sum(api.lane.getLength(f"{road}_0") for road in route[index + 1:target])
+        plan = []
+        for i in range(n_lanes):
+            next_lanes = self._route_successor_lanes(f"{edge}_{i}", next_edge)
+            shifts = min((abs(int(lane.rsplit("_", 1)[1]) - goal)
+                          for lane in next_lanes for goal in next_goals), default=None)
+            plan.append((room, shifts))
+        return tuple(plan)
+
+    def _lane_change_margin_observation(self, context, speed):
+        if context is None:
+            return 1.0
+        route, index, target, valid_lanes = context
+        key = (route, index, target)
+        if key not in self._lane_change_margin_plan_cache:
+            self._lane_change_margin_plan_cache[key] = self._lane_change_margin_plan(
+                route, index, target, valid_lanes)
+        lane = self._api.vehicle.getLaneIndex(self.ego_id)
+        room, shifts = self._lane_change_margin_plan_cache[key][lane]
+        if shifts is None:
+            return -1.0
+        if shifts == 0:
+            return 1.0
+        if target == index + 1:
+            room -= self._api.vehicle.getLanePosition(self.ego_id)
+        # Phase 1 accepts consecutive changes at one lane per simulation
+        # step. This is a constant-speed estimate without gaps in traffic.
+        margin = room - shifts * speed * self.step_length
+        return max(-1.0, min(1.0, margin / self.lane_change_margin_scale))
+
+    def _early_lane_change_reward(self, context, lane_before, lane_after):
+        if (context is None or lane_before == lane_after
+                or self._api.vehicle.getRoadID(self.ego_id) != context[0]):
+            return 0.0
+        _, target, valid_lanes = context
+        before = min(abs(lane_before - lane) for lane in valid_lanes)
+        after = min(abs(lane_after - lane) for lane in valid_lanes)
+        best = min(before, self._early_lane_best.get(target, before))
+        self._early_lane_best[target] = min(best, after)
+        paid = self._early_lane_units_paid.get(target, 0)
+        units = min(max(0, best - after), 3 - paid)
+        self._early_lane_units_paid[target] = paid + units
+        return units * float(self.rw.get("early_lane_change_bonus", 0.0))
+
     def _lookahead_connectivity_observation(self):
-        """각 후보 차선에서 다음 두 route edge까지 무변경 연결: -1/0/1.
+        """각 후보 차선에서 설정한 수만큼 다음 route edge까지 무변경 연결: -1/0/1.
 
         거리/신호 상태와 독립적인 차선 선택 안내다. 0이어도 중간 도로에서
         차선을 바꿔 진행할 수 있으므로 잘못된 차선 종료 판정에는 사용하지 않는다.
@@ -589,10 +748,17 @@ class SumoHighwayEnv(gym.Env):
         """
         edge = self._api.vehicle.getRoadID(self.ego_id)
         current_index = self._api.vehicle.getLaneIndex(self.ego_id)
-        lane_count = self._api.edge.getLaneNumber(edge)
         route = self._api.vehicle.getRoute(self.ego_id)
         route_index = self._api.vehicle.getRouteIndex(self.ego_id)
-        next_edges = route[route_index + 1:route_index + 3]
+        if edge.startswith(":") and self.junction_lane_reference:
+            reference = self._lane_observation_reference()
+            if reference is None:
+                return [1.0] * len(self.connectivity_offsets)
+            edge, current_index, _ = reference
+            if 0 <= route_index < len(route) - 1 and route[route_index + 1] == edge:
+                route_index += 1
+        lane_count = self._api.edge.getLaneNumber(edge)
+        next_edges = route[route_index + 1:route_index + 1 + self.lookahead_edges]
         values = []
         for offset in self.connectivity_offsets:
             index = current_index + offset
@@ -624,13 +790,18 @@ class SumoHighwayEnv(gym.Env):
         """
         try:
             edge = self._api.vehicle.getRoadID(self.ego_id)
-            if edge.startswith(":"):          # 교차로 내부: 중립값
-                return 0.0
-            lane_index = self._api.vehicle.getLaneIndex(self.ego_id) + offset
+            if edge.startswith(":"):
+                reference = self._lane_observation_reference() if self.junction_lane_reference else None
+                if reference is None:
+                    return 0.0
+                edge, index, ego_pos = reference
+            else:
+                index = self._api.vehicle.getLaneIndex(self.ego_id)
+                ego_pos = self._api.vehicle.getLanePosition(self.ego_id)
+            lane_index = index + offset
             if lane_index < 0 or lane_index >= self._api.edge.getLaneNumber(edge):
                 return 1.0                    # 차선 없음 = 꽉 참 취급
             lane_id = f"{edge}_{lane_index}"
-            ego_pos = self._api.vehicle.getLanePosition(self.ego_id)
             remaining = self._api.lane.getLength(lane_id) - ego_pos
             links = self._api.lane.getLinks(lane_id)
 
@@ -744,12 +915,16 @@ class SumoHighwayEnv(gym.Env):
                      if signal[3].lower() == "r"), None)
 
     def _signal_observation(self, signal):
+        fine_scale = self.signal_fine_distance_scale
         if signal is None or signal[2] > self.signal_visibility:
-            return [1.0, 0.0, 0.0, 0.0, 1.0]
+            return [1.0, 0.0, 0.0, 0.0, 1.0] + ([1.0] if fine_scale > 0 else [])
         color = signal[3].lower()
         index = {"g": 1, "y": 2, "r": 3}.get(color, 0)
         one_hot = [float(i == index) for i in range(4)]
-        return one_hot + [float(np.clip(signal[2] / self.signal_visibility, 0, 1))]
+        distances = [float(np.clip(signal[2] / self.signal_visibility, 0, 1))]
+        if fine_scale > 0:
+            distances.append(float(np.clip(signal[2] / fine_scale, 0, 1)))
+        return one_hot + distances
 
     def _red_stop_penalty(self, signal):
         """관측된 적신호까지의 이동 여유에 비례한 감점. 속도 조건은 두지 않는다."""
@@ -766,6 +941,22 @@ class SumoHighwayEnv(gym.Env):
         if scale <= 0:
             raise ValueError("red_stop_distance_scale must be positive")
         return coef * float(np.clip(min(front_room, stop_room) / scale, 0.0, 1.0))
+
+    def _red_park_penalty(self, red_signal, speed):
+        """Penalize slow movement beyond the upper edge of the red stop zone."""
+        coef = float(self.rw.get("red_park_penalty_coef", 0.0))
+        if coef <= 0.0 or red_signal is None or speed > 2.0:
+            return 0.0
+        remaining = red_signal[2] - float(self.rw.get("red_safe_zone_max_gap", 5.0))
+        return coef * min(max(remaining / 10.0, 0.0), 1.0)
+
+    def _red_stop_close_penalty(self, red_signal):
+        """Penalize getting too close to an observed red stop line."""
+        coef = float(self.rw.get("red_stop_close_penalty_coef", 0.0))
+        if coef <= 0.0 or red_signal is None:
+            return 0.0
+        distance = max(0.0, red_signal[2])
+        return coef * max(0.0, float(self.rw.get("red_stop_close_distance", 1.0)) - distance)
 
     def _red_stop_clearance_reward(self, signal, speed):
         """Reward a safe, small gap to the next red stop line or a nearer leader."""
@@ -811,10 +1002,11 @@ class SumoHighwayEnv(gym.Env):
             return 0.0
         return min(per_meter * traveled, float(self.rw.get("red_stop_progress_cap", 0.02)))
 
-    def _red_speed_tracking_reward(self, signal, speed):
+    def _red_speed_tracking_reward(self, signal, speed, *, yellow_target_decel=None):
         """Reward matching a braking speed profile towards the current red stop target."""
         cap = float(self.rw.get("red_speed_tracking_cap", 0.0))
-        if (cap <= 0 or signal is None or signal[3].lower() != "r"
+        allowed_colors = ("y", "r") if yellow_target_decel is not None else ("r",)
+        if (cap <= 0 or signal is None or signal[3].lower() not in allowed_colors
                 or signal[2] > self.signal_visibility):
             return 0.0
 
@@ -822,9 +1014,13 @@ class SumoHighwayEnv(gym.Env):
         if surplus < 0:
             return 0.0
         safe_decel = float(self.rw.get("red_speed_tracking_safe_decel", 2.5))
+        if yellow_target_decel is not None:
+            safe_decel = float(self.rw["yellow_tracking_max_decel"])
         if speed ** 2 > 2.0 * safe_decel * surplus:
             return 0.0
         target_decel = float(self.rw.get("red_speed_tracking_target_decel", 1.5))
+        if yellow_target_decel is not None:
+            target_decel = max(target_decel, yellow_target_decel)
         # Limit speed to the remaining metres per second near the target.
         target_speed = min(self.vmax, sqrt(2.0 * target_decel * surplus), surplus)
         tolerance = max(0.5, 0.5 * target_speed)
@@ -836,6 +1032,45 @@ class SumoHighwayEnv(gym.Env):
         # Give a small reward for holding the target stop, below the moving cap.
         weight = 0.25 + 0.75 * min(target_speed / 2.0, 1.0)
         return cap * weight * score
+
+    def _update_yellow_tracking_plan(self, signal, speed):
+        limit = float(self.rw.get("yellow_tracking_max_decel", 0.0))
+        if limit <= 0 or signal is None or signal[2] > self.signal_visibility:
+            self._yellow_tracking_plan = None
+            return None
+        key = signal[:2]
+        color = signal[3].lower()
+        if color not in ("y", "r"):
+            self._yellow_tracking_plan = None
+            return None
+        if self._yellow_tracking_plan is not None and self._yellow_tracking_plan[0] == key:
+            return self._yellow_tracking_plan[1]
+        if color == "y":
+            remaining = self._red_stop_surplus(signal)
+            required = speed ** 2 / (2.0 * remaining) if remaining > 0 else float("inf")
+            self._yellow_tracking_plan = (key, required if required <= limit else None)
+            return self._yellow_tracking_plan[1]
+        self._yellow_tracking_plan = None
+        return None
+
+    def _red_approach_tracking_reward(self, signal_before, signal_after, speed, traveled,
+                                      speed_before=None):
+        """Pay for forward approach outside the stop zone in new training runs."""
+        yellow_enabled = float(self.rw.get("yellow_tracking_max_decel", 0.0)) > 0.0
+        yellow_target = None
+        if yellow_enabled:
+            if speed_before is not None:
+                self._update_yellow_tracking_plan(signal_before, speed_before)
+            yellow_target = self._update_yellow_tracking_plan(signal_after, speed)
+        if yellow_enabled or self.rw.get("red_speed_tracking_approach_only", False):
+            allowed_colors = ("y", "r") if yellow_target is not None else ("r",)
+            if (signal_before is None or signal_after is None or traveled <= 1e-6
+                    or signal_before[:2] != signal_after[:2]
+                    or signal_before[3].lower() not in allowed_colors
+                    or signal_before[2] - signal_after[2] <= 1e-6
+                    or signal_after[2] <= float(self.rw.get("red_safe_zone_max_gap", 5.0))):
+                return 0.0
+        return self._red_speed_tracking_reward(signal_after, speed, yellow_target_decel=yellow_target)
 
     def _red_stopped_brake_penalty(self, signal_before, signal_after, speed_before, accel):
         """Discourage braking after stopping, when there is room to approach the red."""
@@ -965,6 +1200,12 @@ class SumoHighwayEnv(gym.Env):
             obs.extend(self._lookahead_connectivity_observation())
         if self.destination_enabled:
             obs.extend(self._destination_observation())
+        if self.lane_decision_distance_scale > 0 or self.lane_change_margin_scale > 0:
+            lane_decision = self._lane_decision_context()
+            if self.lane_decision_distance_scale > 0:
+                obs.append(self._lane_decision_distance_observation(lane_decision))
+            if self.lane_change_margin_scale > 0:
+                obs.append(self._lane_change_margin_observation(lane_decision, v))
         return np.clip(np.array(obs, dtype=np.float32), -1.0, 1.0)
 
     # ==================================================================
@@ -1158,6 +1399,7 @@ class SumoHighwayEnv(gym.Env):
         lane_raw = float(np.clip(action_arr[self.lane_change_index], -1.0, 1.0))
         lane_change = self._quantize_lane_change(lane_raw)
         lane_change_applied = False
+        early_lane_context = None
         lane_before = None
         speed_before = None
 
@@ -1172,6 +1414,8 @@ class SumoHighwayEnv(gym.Env):
             self._api.vehicle.setSpeed(
                 self.ego_id, float(np.clip(speed_before + dv, 0.0, self.vmax)))
 
+            if lane_change and self.rw.get("early_lane_change_bonus", 0.0) > 0.0:
+                early_lane_context = self._early_lane_change_context()
             lane_change_applied = self._apply_lane_change(lane_change)
 
         # 신호 상태는 행동이 적용되는 스텝 시작 시점을 기준으로 판정한다.
@@ -1181,11 +1425,11 @@ class SumoHighwayEnv(gym.Env):
         distance_before = (self._api.vehicle.getDistance(self.ego_id)
                            if signals_before else None)
         return (accel_raw, lane_raw, lane_change, lane_change_applied, lane_before, speed_before,
-                signals_before, route_connected_before, distance_before)
+                signals_before, route_connected_before, distance_before, early_lane_context)
 
     def _finish_step(self, state, *, collided, arrived):
         (accel_raw, lane_raw, lane_change, lane_change_applied, lane_before, speed_before,
-         signals_before, route_connected_before, distance_before) = state
+         signals_before, route_connected_before, distance_before, early_lane_context) = state
         self.step_count += 1
         alive = self._ego_is_present()
         lane_after = int(self._api.vehicle.getLaneIndex(self.ego_id)) if alive else None
@@ -1211,6 +1455,8 @@ class SumoHighwayEnv(gym.Env):
         terminated, truncated = False, False
         ego_speed, ego_gap = None, None
         red_stop_penalty = 0.0
+        red_stop_close_penalty = 0.0
+        red_park_penalty = 0.0
         red_stop_clearance_reward = 0.0
         red_stop_progress_reward = 0.0
         red_speed_tracking_reward = 0.0
@@ -1218,6 +1464,7 @@ class SumoHighwayEnv(gym.Env):
         red_safe_zone_first_reward = red_safe_zone_hold_reward = 0.0
         green_stop_penalty = 0.0
         green_pass_reward = 0.0
+        early_lane_change_reward = 0.0
 
         # ----- (4) 기존 보상 유지 -----
         if red_light_violation:
@@ -1244,12 +1491,18 @@ class SumoHighwayEnv(gym.Env):
             reward = float(self.rw["speed_weight"]) * ego_speed / self.vmax
             red_stop_penalty = self._red_stop_penalty(red_signal)
             reward -= red_stop_penalty
+            red_stop_close_penalty = self._red_stop_close_penalty(red_signal)
+            reward -= red_stop_close_penalty
+            red_park_penalty = self._red_park_penalty(red_signal, ego_speed)
+            reward -= red_park_penalty
             red_stop_clearance_reward = self._red_stop_clearance_reward(signal_after, ego_speed)
             reward += red_stop_clearance_reward
             red_stop_progress_reward = self._red_stop_progress_reward(
                 signals_before[0] if signals_before else None, signal_after, ego_speed, traveled)
             reward += red_stop_progress_reward
-            red_speed_tracking_reward = self._red_speed_tracking_reward(signal_after, ego_speed)
+            red_speed_tracking_reward = self._red_approach_tracking_reward(
+                signals_before[0] if signals_before else None, signal_after, ego_speed, traveled,
+                speed_before)
             reward += red_speed_tracking_reward
             red_stopped_brake_penalty = self._red_stopped_brake_penalty(
                 signals_before[0] if signals_before else None, signal_after, speed_before, accel_raw)
@@ -1277,6 +1530,10 @@ class SumoHighwayEnv(gym.Env):
                 reward -= bp
 
             # ---- 차선변경 보상 항 ----
+            off_route_penalty = float(self.rw.get("off_route_lane_penalty", 0.0))
+            if off_route_penalty > 0.0 and self._lane_connectivity(0) < 1.0:
+                reward -= off_route_penalty
+
             # lane_change        : 이번 스텝에 policy가 낸 양자화 명령 (-1/0/+1)
             # lane_change_applied: 그 명령이 실제로 실행됐는지
             # 주의: _apply_lane_change는 유지 명령(0)에도 현재 차선으로
@@ -1304,6 +1561,13 @@ class SumoHighwayEnv(gym.Env):
         if self.step_count >= self.max_steps:
             truncated = True
 
+        if (early_lane_context is not None and alive and not (terminated or truncated)
+                and lane_change and lane_change_applied
+                and lane_after == lane_before + lane_change):
+            early_lane_change_reward = self._early_lane_change_reward(
+                early_lane_context, lane_before, lane_after)
+            reward += early_lane_change_reward
+
         if green_passed and not (red_light_violation or collided or wrong_lane):
             green_pass_reward = len(green_passed) * float(self.rw.get("green_pass_bonus", 0.0))
             reward += green_pass_reward
@@ -1314,6 +1578,7 @@ class SumoHighwayEnv(gym.Env):
             "collided": collided,
             "arrived": arrived,
             "wrong_lane": wrong_lane,
+            "early_lane_change_reward": early_lane_change_reward,
             "red_light_violation": red_light_violation,
             "green_pass_reward": green_pass_reward,
             "green_stop_penalty": green_stop_penalty,
@@ -1324,6 +1589,8 @@ class SumoHighwayEnv(gym.Env):
                 for sig in self._observed_signals(signals_after)],
             "red_signal_distance": red_signal[2] if red_signal is not None else None,
             "red_stop_penalty": red_stop_penalty,
+            "red_stop_close_penalty": red_stop_close_penalty,
+            "red_park_penalty": red_park_penalty,
             "red_stop_clearance_reward": red_stop_clearance_reward,
             "red_stop_progress_reward": red_stop_progress_reward,
             "red_speed_tracking_reward": red_speed_tracking_reward,

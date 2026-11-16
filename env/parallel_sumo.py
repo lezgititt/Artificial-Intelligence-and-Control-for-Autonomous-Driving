@@ -352,9 +352,17 @@ class ParallelSumo:
     def step_evaluation(self, indices, actions):
         """Advance only active evaluation egos without starting another episode."""
         egos = [self.egos[index] for index in indices]
-        for ego, transition in zip(egos, self._advance(egos, actions), strict=True):
+        locations = [
+            (libsumo.vehicle.getRoadID(ego.ego_id), libsumo.vehicle.getLanePosition(ego.ego_id))
+            for ego in egos
+        ]
+        for ego, transition, (edge, position) in zip(
+                egos, self._advance(egos, actions), locations, strict=True):
             transition[4].update(start_lane=ego.start_lane, signal_offset_s=ego.signal_offset_s,
                                  traffic_vph=ego.background.vph if ego.background is not None else 0)
+            prefix = ego.prefix("")
+            transition[4].update(lane_change_edge=edge.removeprefix(prefix),
+                                 lane_change_position_m=position)
             clearance = ego.get_stop_clearance()
             if clearance is not None:
                 transition[4].update(clearance)

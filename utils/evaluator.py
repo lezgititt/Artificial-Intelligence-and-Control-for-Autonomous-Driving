@@ -65,7 +65,14 @@ class _EpisodeStats:
     last_stop_reference: str | None = None
     red_wait_clearance_m: float | None = None
     red_wait_reference: str | None = None
+    first_signal_stop_clearance_m: float | None = None
+    green_restart_wait_signal: tuple | None = None
+    green_restart_start_step: int | None = None
+    green_restart_steps: int | None = None
+    green_restart_finished: bool = False
     start_lane: int | None = None
+    first_lane_change_edge: str | None = None
+    first_lane_change_position_m: float | None = None
     signal_offset_s: float | None = None
     traffic_vph: int | None = None
     speeds: list[float] = field(default_factory=list)
@@ -80,13 +87,22 @@ class _DrivingStats:
         stats = self.episodes[episode]
         stats.reward += reward
         stats.length += 1
+        self._record_green_restart(stats, info)
         stats.lane_changes += int(info.get("lane_change", 0) != 0 and bool(info.get("lane_change_applied")))
+        if (stats.first_lane_change_edge is None and info.get("lane_change_applied")
+                and info.get("lane_before") != info.get("lane_after")
+                and info.get("lane_after") is not None and info.get("lane_change")):
+            stats.first_lane_change_edge = info.get("lane_change_edge")
+            stats.first_lane_change_position_m = info.get("lane_change_position_m")
         stats.green_passes += int(info.get("green_pass_count", info.get("green_pass_reward", 0.0) > 0))
         stats.red_stop_cost += float(info.get("red_stop_penalty", 0.0))
         if "stop_clearance_m" in info:
             stats.last_stop_clearance_m = info["stop_clearance_m"]
             stats.last_stop_reference = info["stop_reference"]
             signals = info.get("observed_signals", ())
+            if (stats.first_signal_stop_clearance_m is None and info["stop_clearance_m"] is not None
+                    and signals and signals[0]["state"].lower() in ("y", "r")):
+                stats.first_signal_stop_clearance_m = info["stop_clearance_m"]
             if (info["stop_clearance_m"] is not None and signals
                     and signals[0]["state"].lower() == "r"):
                 stats.red_wait_clearance_m = info["stop_clearance_m"]
@@ -108,6 +124,32 @@ class _DrivingStats:
             stats.speeds.append(float(info["speed"]))
         if info.get("gap") is not None:
             stats.gaps.append(float(info["gap"]))
+
+    @staticmethod
+    def _record_green_restart(stats, info):
+        if stats.green_restart_finished:
+            return
+        signals = info.get("observed_signals", ())
+        signal = signals[0] if signals else None
+        key = (signal["tls_id"], signal["link_index"]) if signal else None
+        color = signal["state"].lower() if signal else None
+        speed = info.get("speed")
+        if stats.green_restart_start_step is not None:
+            same_green = key == stats.green_restart_wait_signal and color == "g"
+            if (same_green and speed is not None and speed > 0.5) or info.get("green_pass_count", 0):
+                stats.green_restart_steps = stats.length - stats.green_restart_start_step
+                stats.green_restart_finished = True
+            elif not same_green:
+                stats.green_restart_finished = True
+        elif color == "g" and key == stats.green_restart_wait_signal:
+            stats.green_restart_start_step = stats.length
+            if speed is not None and speed > 0.5:
+                stats.green_restart_steps = 0
+                stats.green_restart_finished = True
+        elif color == "r" and speed is not None and speed <= 0.5:
+            stats.green_restart_wait_signal = key
+        elif key != stats.green_restart_wait_signal or (speed is not None and speed > 0.5):
+            stats.green_restart_wait_signal = None
 
     def metrics(self, visibility, episodes=None):
         episodes = self.episodes if episodes is None else episodes
@@ -179,11 +221,17 @@ def evaluate_parallel_routes(policy, env, device, routes, **reset_options):
     return [
         {"status": statuses.get(episode.outcome, episode.outcome or "unknown"),
          "start_lane": episode.start_lane, "signal_offset_s": episode.signal_offset_s,
+         "first_lane_change_edge": episode.first_lane_change_edge,
+         "first_lane_change_position_m": episode.first_lane_change_position_m,
          "traffic_vph": episode.traffic_vph,
          "last_stop_clearance_m": episode.last_stop_clearance_m,
          "last_stop_reference": episode.last_stop_reference,
          "red_wait_clearance_m": episode.red_wait_clearance_m,
          "red_wait_reference": episode.red_wait_reference,
+         "first_signal_stop_clearance_m": episode.first_signal_stop_clearance_m,
+         "green_restart_observed": episode.green_restart_start_step is not None,
+         "green_restart_delay_s": (None if episode.green_restart_steps is None else
+                                   episode.green_restart_steps * env.prototype.step_length),
          **stats.metrics(env.prototype.visibility, [episode]).as_dict()}
         for episode in stats.episodes
     ]

@@ -65,7 +65,7 @@ class ParallelPPO(PPO):
         return obs, np.concatenate(advantages), np.concatenate(returns), finished
 
     def learn_parallel(self, env, total_timesteps, logger=None, log_interval=1,
-                       evaluate=None, eval_interval=0, eval_episodes=None):
+                       evaluate=None, eval_interval=0, eval_episodes=None, on_iteration=None):
         if self.n_steps < env.num_envs or self.n_steps % env.num_envs:
             raise ValueError("n_steps must be a positive multiple of num_envs")
         if eval_interval > 0 and evaluate is None:
@@ -81,6 +81,8 @@ class ParallelPPO(PPO):
             recent_returns.extend(finished)
             stats = self.update(advantages, returns)
             iteration += 1
+            if on_iteration is not None:
+                on_iteration(iteration)
             if logger is not None:
                 metrics = {
                     "iteration": iteration,

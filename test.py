@@ -106,6 +106,8 @@ if __name__ == "__main__":
                         help="재생/평가할 에피소드 수")
     parser.add_argument("--route", default=None,
                         help="ego 경로 ID 고정 (예: ego_d_A4_A2). 생략하면 기존 랜덤 경로")
+    parser.add_argument("--depart-lane", type=int, help="출발 차선 번호 고정 (0부터 시작)")
+    parser.add_argument("--signal-offset", type=float, help="에피소드 시작 시 신호 주기 내 시점(초)")
     parser.add_argument("--seed", type=int, default=None,
                         help="평가 시작 시드. 에피소드별 seed, seed+1, ... 적용")
     parser.add_argument("--saved-config", action="store_true",
@@ -117,6 +119,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.episodes < 1:
         parser.error("--episodes는 1 이상이어야 합니다.")
+    if args.depart_lane is not None and (args.depart_lane < 0 or not args.route):
+        parser.error("--depart-lane에는 0 이상인 차선 번호와 --route가 필요합니다.")
     if args.seed is not None and not 0 <= args.seed <= 2**32 - args.episodes:
         parser.error("--seed는 0 이상이며 마지막 에피소드 시드는 2**32 미만이어야 합니다.")
 
@@ -159,6 +163,29 @@ if __name__ == "__main__":
     if args.route:
         # 평가 인스턴스에만 적용한다. 학습 설정과 도로 원본은 변경하지 않는다.
         env._choose_ego_route = lambda: args.route
+    if args.depart_lane is not None:
+        env._ego_depart_lane_cfg = str(args.depart_lane)
+    if args.signal_offset is not None:
+        from env.parallel_sumo import _signal_schedule
+
+        cfg = ET.parse(sumocfg).getroot()
+        net = os.path.join(os.path.dirname(sumocfg), cfg.find("input/net-file").get("value"))
+        signal_ids, end_ticks = _signal_schedule(ET.parse(net).getroot(), env.step_length, True)
+        offset_tick = args.signal_offset / env.step_length
+        if not (0 <= offset_tick < end_ticks[-1] and offset_tick.is_integer()):
+            parser.error("--signal-offset은 신호 주기 안의 시뮬레이션 스텝 단위여야 합니다.")
+        phase = next(i for i, end in enumerate(end_ticks) if offset_tick < end)
+        remaining = float((end_ticks[phase] - offset_tick) * env.step_length)
+        original_reset = env.reset
+
+        def reset_with_signal_offset(*args, **kwargs):
+            _, info = original_reset(*args, **kwargs)
+            for tls_id in signal_ids:
+                env._api.trafficlight.setPhase(tls_id, phase)
+                env._api.trafficlight.setPhaseDuration(tls_id, remaining)
+            return env._get_obs(), info
+
+        env.reset = reset_with_signal_offset
 
     if not args.nogui:
         print("※ 창이 뜨면 ▶(플레이) 버튼을 눌러야 에피소드가 시작됩니다.")
