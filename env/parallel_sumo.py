@@ -5,14 +5,17 @@ from functools import partial
 from multiprocessing import get_context
 from pathlib import Path
 import signal
+import sqlite3
 import traceback
 import xml.etree.ElementTree as ET
 
 import numpy as np
 
 from env.ego_routes import group_unique_ego_routes
+from env.ring_observation import prefix_geometry
 from env.sumo_env import SumoHighwayEnv
-from env.parallel_traffic import TrafficSchedule, parse_traffic_flows
+from env.parallel_traffic import TrafficFocus, TrafficSchedule, parse_traffic_flows
+from env.traffic_snapshots import TrafficSnapshotBank, pick_snapshot
 
 import libsumo
 
@@ -139,9 +142,19 @@ class _ReplicaEgo(SumoHighwayEnv):
     def _destination_edge(self):
         return super()._destination_edge().split("_", 1)[1]
 
-    def _neighbor(self, offset, leader):
+    def _neighbor(self, offset, leader, *, physical=False):
         if self.background is not None and self.background.vph:
-            return super()._neighbor(offset, leader)
+            if offset and self.use_live_lane_neighbors:
+                # getNeighbors can populate SUMO's per-tick leader cache.
+                # A snapshot reset removes those cars before the next tick,
+                # leaving stale leaders for native movement planning.
+                front, rear = self._scan_lane_neighbors(offset)
+                neighbor = front if leader else rear
+                if (neighbor is None or neighbor[0] > self.visibility
+                        or (neighbor[0] < 0 and not physical)):
+                    return None
+                return (max(neighbor[0], 0), neighbor[1]) if physical else neighbor
+            return super()._neighbor(offset, leader, physical=physical)
         return None
 
     def _scan_lane_neighbors(self, direction):
@@ -153,7 +166,8 @@ class _ReplicaEgo(SumoHighwayEnv):
 class ParallelSumo:
     def __init__(self, num_envs, env_kwargs, directory, seed, *, randomize_signals=False,
                  randomize_departures=False, independent_episode_rng=False,
-                 traffic_curriculum=None, fixed_traffic_vph=None):
+                 traffic_curriculum=None, fixed_traffic_vph=None, traffic_snapshot_path=None,
+                 fixed_training_routes=False, focused_envs=0):
         if num_envs < 1:
             raise ValueError("num_envs must be positive")
         self.num_envs = num_envs
@@ -162,11 +176,21 @@ class ParallelSumo:
         self.independent_episode_rng = independent_episode_rng or randomize_departures
         self.traffic_curriculum = traffic_curriculum
         self.fixed_traffic_vph = fixed_traffic_vph
+        self.fixed_training_routes = fixed_training_routes
+        self.focused_envs = focused_envs
+        self._snapshot_config = env_kwargs["cfg_path"]
+        self._snapshot_path = traffic_snapshot_path
+        self._snapshot_bank = None
+        self._snapshot_db = None
+        if traffic_curriculum and traffic_curriculum.snapshot_warmup_seconds and not randomize_signals:
+            raise ValueError("Traffic snapshots require a cycling signal program")
         if fixed_traffic_vph is not None and (
                 traffic_curriculum is None or not 0 <= fixed_traffic_vph <= traffic_curriculum.max_vph):
             raise ValueError("Fixed traffic requires a traffic profile and a value within its limits")
         self.prototype = _ReplicaEgo(**env_kwargs)
         self.prototype.background = None
+        self.prototype.use_live_lane_neighbors = bool(
+            traffic_curriculum and traffic_curriculum.snapshot_warmup_seconds)
         if (self.prototype.road_type != "nohyeong" or self.prototype.warmup_seconds
                 or self.prototype.prefill_enabled or self.prototype.gui):
             raise ValueError("ParallelSumo requires a headless intersection without global warm-up")
@@ -178,15 +202,28 @@ class ParallelSumo:
                             randomize_signals, traffic_curriculum,
                             self.prototype.traffic.get("vehs_per_hour", 0)))
         self.routes = tuple(sorted(self.route_entries))
+        self.focus = None
+        if focused_envs:
+            if not fixed_training_routes or not 0 < focused_envs <= num_envs or traffic_curriculum is None:
+                raise ValueError("Focused replicas require Phase 2 fixed-route training")
+            if any(vph not in traffic_curriculum.snapshot_levels(None) for vph in TrafficFocus.levels):
+                raise ValueError("Missing traffic snapshot levels for focused replicas")
+            unique_routes = sum(self.route_groups, ())
+            if (num_envs - focused_envs) % len(unique_routes):
+                raise ValueError("Each worker's fixed replica count must be divisible by its route count")
+            self.focus = TrafficFocus(unique_routes)
         self.departures = {}
         self.egos = []
         self.started = False
         self._live_background = set()
 
-    def _start(self, config):
-        libsumo.start(["sumo", "-c", config, "--step-length", str(self.prototype.step_length),
+    def _start(self, config, *, show_gui=False):
+        traffic_options = self.traffic_curriculum.sumo_options() if self.traffic_curriculum else []
+        gui_options = ["--start"] if show_gui else []
+        libsumo.start(["sumo-gui" if show_gui else "sumo", "-c", config,
+                       "--step-length", str(self.prototype.step_length),
                        "--seed", str(self.seed), "--collision.action", "remove",
-                       "--no-warnings", "true", "--no-step-log", "true"])
+                       "--no-warnings", "true", "--no-step-log", "true", *traffic_options, *gui_options])
         self.started = True
 
     def _find_departures(self):
@@ -214,7 +251,7 @@ class ParallelSumo:
                             raise ValueError(f"Configured departure lane is unavailable on {edge}")
                     self.departures[route] = tuple(lanes)
             finally:
-                self.close()
+                self._close_simulation()
             return
         # Query the exact lane SUMO picks for every route under the baseline's
         # departLane setting. moveTo can then insert there without a global tick.
@@ -231,15 +268,55 @@ class ParallelSumo:
                 self.departures[route] = ((lane, position, libsumo.vehicle.getLaneIndex(ego.ego_id)),)
                 libsumo.vehicle.remove(ego.ego_id)
         finally:
-            self.close()
+            self._close_simulation()
+
+    def _start_traffic_snapshots(self):
+        if self.traffic_curriculum and self.traffic_curriculum.snapshot_warmup_seconds:
+            levels = self.traffic_curriculum.snapshot_levels(self.fixed_traffic_vph)
+            if levels:
+                return TrafficSnapshotBank(
+                    self._snapshot_config, self.traffic_curriculum,
+                    self.prototype.traffic["vehs_per_hour"], levels,
+                    self.prototype.step_length, self.seed, refresh=self.fixed_traffic_vph is None)
+        return None
+
+    def training_route_assignments(self, num_envs):
+        """Balance all replicas globally before splitting them among workers."""
+        if self.focus is not None:
+            result = []
+            for worker in range(num_envs // self.num_envs):
+                routes = self.focus.routes
+                fixed = list(routes) * ((self.num_envs - self.focused_envs) // len(routes))
+                rng = np.random.default_rng(np.random.SeedSequence([self.seed, num_envs, worker]))
+                rng.shuffle(fixed)
+                result.extend(fixed + [None] * self.focused_envs)
+            return result
+        direct, ring = self.route_groups
+        if not direct or not ring:
+            group = direct or ring
+            if not group:
+                raise ValueError("Fixed training routes require ego routes")
+            routes = [group[i % len(group)] for i in range(num_envs)]
+        else:
+            n_ring = round(num_envs * self.prototype.ego_ring_prob)
+            routes = [direct[i % len(direct)] for i in range(num_envs - n_ring)]
+            routes.extend(ring[i % len(ring)] for i in range(n_ring))
+        rng = np.random.default_rng(np.random.SeedSequence([self.seed, num_envs]))
+        rng.shuffle(routes)
+        return routes
 
     def _respawn(self, ego, route=None, traffic_vph=None, signal_tick=None):
         if ego.present:
             libsumo.vehicle.remove(ego.ego_id)
         if route is None:
+            route = ego.fixed_training_route
+        if route is None:
             route = ego._sample_ego_route(self.route_groups) if ego.ego_route_random else "r0"
         ego.signal_offset_s = None
+        offset = None
         if self.signal_ids:
+            # When using the snapshot bank, this tick selects the paired
+            # traffic and signal state. The signal is never randomized again.
             offset = ego.signal_random.integers(self.signal_end_ticks[-1]) if signal_tick is None else signal_tick
             ego.signal_offset_s = float(offset * ego.step_length)
             phase = int(np.searchsorted(self.signal_end_ticks, offset, side="right"))
@@ -255,6 +332,12 @@ class ParallelSumo:
             vph = ego.background.vph if traffic_vph is None else traffic_vph
             ego.background.reset(libsumo, libsumo.simulation.getTime(), vph,
                                  ego.traffic_random, self._live_background)
+            if vph and self._snapshot_db is not None:
+                clearance = (libsumo.vehicletype.getLength("ego_type")
+                             + libsumo.vehicletype.getMinGap("ego_type"))
+                vehicles = pick_snapshot(self._snapshot_db, vph, int(offset),
+                                         ego.traffic_random, lane, position, clearance)
+                ego.background.restore(libsumo, ego.prefix, vehicles)
         ego.episode += 1
         ego.ego_id = _replica_id(ego.replica_index, f"ego_{ego.episode}")
         ego._spawn_ego(_replica_id(ego.replica_index, route), str(lane_index))
@@ -263,16 +346,25 @@ class ParallelSumo:
         return ego._get_obs()
 
     def reset(self, routes=None, *, replica_seeds=None, signal_ticks=None):
-        if routes is not None and (len(routes) != self.num_envs or set(routes) - set(self.routes)):
+        if routes is None and self.fixed_training_routes:
+            routes = self.training_route_assignments(self.num_envs)
+        valid_routes = set(self.routes) | ({None} if self.focus is not None else set())
+        if routes is not None and (len(routes) != self.num_envs or set(routes) - valid_routes):
             raise ValueError("Expected one valid route per replica")
         if signal_ticks is not None and (
                 not self.signal_ids or len(signal_ticks) != self.num_envs
                 or any(not isinstance(tick, (int, np.integer)) or
                        not 0 <= tick < self.signal_end_ticks[-1] for tick in signal_ticks)):
             raise ValueError("Expected one valid signal tick per replica")
-        self.close()
+        self._close_simulation()
         if not self.departures:
             self._find_departures()
+        if self._snapshot_path is None:
+            self._snapshot_bank = self._start_traffic_snapshots()
+            if self._snapshot_bank is not None:
+                self._snapshot_path = self._snapshot_bank.path
+        if self._snapshot_path is not None and self._snapshot_db is None:
+            self._snapshot_db = sqlite3.connect(f"file:{self._snapshot_path}?mode=ro", uri=True)
         self._start(self.config)
         self._live_background.clear()
         self.egos = []
@@ -303,6 +395,11 @@ class ParallelSumo:
                 (_replica_id(index, tid), link): offset
                 for (tid, link), offset in self.prototype._signal_stop_offsets.items()
             }
+            ego._guidance_geometry = {
+                (_replica_id(index, a), _replica_id(index, b)): geometry
+                for (a, b), geometry in self.prototype._guidance_geometry.items()
+            }
+            ego._ring_geometry = prefix_geometry(self.prototype._ring_geometry, ego.prefix)
             ego._signal_stop_lines = {
                 (_replica_id(index, tid), link): dict(line, lane_id=_replica_id(index, line["lane_id"]))
                 for (tid, link), line in self.prototype._signal_stop_lines.items()
@@ -310,9 +407,14 @@ class ParallelSumo:
             ego.no_lane_change_edges = {_replica_id(index, edge) for edge in ego.no_lane_change_edges}
             self.egos.append(ego)
             route = routes[index] if routes is not None else None
+            ego.fixed_training_route = route if self.fixed_training_routes else None
             vph = self.fixed_traffic_vph
             if vph is None and self.traffic_curriculum is not None:
                 vph = self.traffic_curriculum.initial_vph
+            ego.focused = self.focus is not None and route is None
+            if ego.focused:
+                ego.focus_random = np.random.default_rng(seed.spawn(1)[0])
+                route, vph = self.focus.sample(ego.focus_random)
             tick = signal_ticks[index] if signal_ticks is not None else None
             observations.append(self._respawn(ego, route, traffic_vph=vph, signal_tick=tick))
         return np.stack(observations)
@@ -341,11 +443,15 @@ class ParallelSumo:
             timeout_obs = obs if truncated and not terminated else None
             if terminated or truncated:
                 vph = self.fixed_traffic_vph
-                if vph is None and ego.background is not None:
-                    success = info["arrived"] and not (info["red_light_violation"] or info["collided"]
-                                                       or info["wrong_lane"])
+                route = None
+                success = info["arrived"] and not (info["red_light_violation"] or info["collided"]
+                                                   or info["wrong_lane"])
+                if ego.focused:
+                    self.focus.record(ego.ego_route_id.removeprefix(ego.prefix("")), ego.background.vph, success)
+                    route, vph = self.focus.sample(ego.focus_random)
+                elif vph is None and ego.background is not None:
                     vph = self.traffic_curriculum.after_episode(ego.background.vph, success)
-                obs = self._respawn(ego, traffic_vph=vph)
+                obs = self._respawn(ego, route=route, traffic_vph=vph)
             transitions.append((obs, reward, terminated, truncated, timeout_obs))
         return transitions
 
@@ -375,13 +481,30 @@ class ParallelSumo:
                                          ego.traffic_random, self._live_background)
             yield transition
 
-    def traffic_levels(self):
+    def _traffic_levels(self):
+        if self._snapshot_bank is not None:
+            self._snapshot_bank.check()
         return [ego.background.vph for ego in self.egos] if self.traffic_flows else []
 
-    def close(self):
+    def traffic_levels(self):
+        if self.focus is not None:
+            self.focus.update(self.focus.drain())
+        return self._traffic_levels()
+
+    def _close_simulation(self):
         if self.started:
             libsumo.close()
             self.started = False
+
+    def close(self):
+        self._close_simulation()
+        if self._snapshot_db is not None:
+            self._snapshot_db.close()
+            self._snapshot_db = None
+        if self._snapshot_bank is not None:
+            self._snapshot_bank.close()
+            self._snapshot_bank = None
+            self._snapshot_path = None
 
 
 def _run_sumo_worker(conn, env, replica_seeds):
@@ -401,6 +524,11 @@ def _run_sumo_worker(conn, env, replica_seeds):
                 break
             elif command == "traffic_levels":
                 conn.send((True, env.traffic_levels()))
+            elif command == "focus_report":
+                conn.send((True, (env._traffic_levels(), env.focus.drain())))
+            elif command == "focus_weights":
+                env.focus.weights = data
+                conn.send((True, None))
             else:
                 raise ValueError(f"Unknown SUMO worker command: {command}")
     except (EOFError, BrokenPipeError):
@@ -421,6 +549,7 @@ class ShardedParallelSumo:
         self.num_envs = template.num_envs * num_workers
         self.num_workers = num_workers
         self._workers = []
+        self._snapshot_bank = None
 
     def _start(self):
         context = get_context("spawn")
@@ -446,15 +575,22 @@ class ShardedParallelSumo:
             try:
                 ok, result = conn.recv()
             except (EOFError, ConnectionError) as exc:
-                raise RuntimeError(f"SUMO worker {i} disconnected") from exc
+                process = self._workers[i][0]
+                process.join(timeout=0.2)
+                raise RuntimeError(f"SUMO worker {i} disconnected (exit code {process.exitcode})") from exc
             if not ok:
                 raise RuntimeError(f"SUMO worker {i} failed:\n{result}")
             yield result
 
     def reset(self, routes=None):
+        if routes is None and self.template.fixed_training_routes:
+            routes = self.template.training_route_assignments(self.num_envs)
         if routes is not None and len(routes) != self.num_envs:
             raise ValueError("Expected one route per environment")
         if not self._workers:
+            self._snapshot_bank = self.template._start_traffic_snapshots()
+            if self._snapshot_bank is not None:
+                self.template._snapshot_path = self._snapshot_bank.path
             self._start()
         size = self.template.num_envs
         batches = (None if routes is None else routes[i:i + size]
@@ -472,6 +608,14 @@ class ShardedParallelSumo:
     def traffic_levels(self):
         if self.template.traffic_curriculum is None:
             return []
+        if self._snapshot_bank is not None:
+            self._snapshot_bank.check()
+        if self.template.focus is not None:
+            reports = list(self._exchange("focus_report", [None] * self.num_workers))
+            levels, counts = zip(*reports, strict=True)
+            self.template.focus.update(np.sum(counts, axis=0))
+            list(self._exchange("focus_weights", [self.template.focus.weights] * self.num_workers))
+            return [vph for shard in levels for vph in shard]
         return [value for shard in self._exchange("traffic_levels", [None] * self.num_workers)
                 for value in shard]
 
@@ -490,3 +634,7 @@ class ShardedParallelSumo:
                 process.join()
             process.close()
         self._workers.clear()
+        if self._snapshot_bank is not None:
+            self._snapshot_bank.close()
+            self._snapshot_bank = None
+            self.template._snapshot_path = None

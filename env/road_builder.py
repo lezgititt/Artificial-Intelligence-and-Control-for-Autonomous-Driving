@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 
 from sumolib import checkBinary  # SUMO 실행파일(sumo, netconvert 등) 경로를 찾아주는 유틸
 from env.mdp_config import SIMULATION
+from env.collision_detection import configure_collision_gaps
 try:
     from env.road_config import SCENERY
 except ImportError:      # 구버전 설정 하위호환
@@ -43,7 +44,10 @@ def build(road: dict, ego: dict, traffic: dict, out_dir: str) -> str:
     # ROAD["type"] == "nohyeong" 이면 노형오거리 생성 (파일 맨 아래 _build_nohyeong).
     # 그 외("straight" 또는 키 없음)는 기존 직선 도로 그대로 생성한다.
     if road.get("type", "straight") == "nohyeong":
-        return _build_nohyeong(road, ego, traffic, out_dir)
+        config = _build_nohyeong(road, ego, traffic, out_dir)
+        configure_collision_gaps(config, ego_gap_m=ego.get('collision_gap_m'),
+                                 background_gap_m=traffic.get('collision_gap_m'))
+        return config
 
     # ──────────────────────────────────────────────────────
     # 1) 노드 파일: 직선 도로의 양 끝점 2개
@@ -164,6 +168,8 @@ def build(road: dict, ego: dict, traffic: dict, out_dir: str) -> str:
         check=True,           # 실패하면 예외를 던져서 바로 알 수 있게
         capture_output=True,  # 출력은 조용히 삼킴
     )
+    configure_collision_gaps(cfg_path, ego_gap_m=ego.get('collision_gap_m'),
+                             background_gap_m=traffic.get('collision_gap_m'))
     return cfg_path
 
 

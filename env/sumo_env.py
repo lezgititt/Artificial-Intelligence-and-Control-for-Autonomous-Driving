@@ -25,7 +25,10 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
+from env.control_timing import lane_change_timing_allowed
 from env.ego_routes import group_unique_ego_routes
+from env.route_guidance import choice_geometry, navigation_observation
+from env.ring_observation import ring_geometry, ring_observation
 
 # SUMO 설치 폴더의 tools/ 안에 traci, sumolib 파이썬 모듈이 들어있다.
 # pip로도 설치했지만, 버전 불일치를 피하려면 SUMO_HOME 쪽을 우선 경로에 추가.
@@ -123,7 +126,7 @@ class SumoHighwayEnv(gym.Env):
         self.lc_rear_min = float(lcs.get("min_rear_gap", 5.0))     # m
         self.lc_front_tau = float(lcs.get("front_tau", 0.3))       # s
         self.lc_rear_tau = float(lcs.get("rear_tau", 0.5))         # s
-        self.lc_spawn_protect = float(lcs.get("spawn_protect", 60.0))  # m
+        self.lc_spawn_protect = float(lcs.get("spawn_protect", 30.0))  # m
         self.lc_horizon = float(lcs.get("approach_horizon", 1.0))       # s
         self.road_length = float(road["length"])
         # ---- 노형오거리(교차로) 모드 설정 ----
@@ -172,10 +175,21 @@ class SumoHighwayEnv(gym.Env):
         self.step_length = float(mdp_sim["step_length"])
         self.max_steps = int(mdp_sim["max_steps"])
         self.warmup_steps = int(mdp_sim["warmup_steps"])
+        self.bc_observation = mdp_obs.get("layout") in ("bc43", "bc49")
+        self.ring_observation_enabled = mdp_obs.get("layout") == "bc49"
+        self.ring_distance_scale = float(mdp_obs.get("ring_distance_scale", 50.0))
+        self.ring_visibility = float(mdp_obs.get("ring_visibility", 50.0))
+        if self.ring_distance_scale <= 0 or self.ring_visibility <= 0:
+            raise ValueError("Ring observation scales must be positive")
+        self._ring_geometry = {}
         self.visibility = float(mdp_obs["visibility"])   # 관측 거리 W
+        # Saved datasets/models without this key keep their original encoding.
+        self.neighbor_distance_mode = mdp_obs.get("neighbor_distance_mode", "legacy")
+        if self.neighbor_distance_mode not in ("legacy", "bumper"):
+            raise ValueError("neighbor_distance_mode must be legacy or bumper")
         # 밀도 정규화용 "차량 1대가 점유하는 길이" (차체 + 최소 간격)
         self.density_veh_len = float(mdp_obs.get("density_veh_length", 7.5))
-        self.connectivity_half_width = int(mdp_obs.get("connectivity_half_width", 2))
+        self.connectivity_half_width = 2 if self.bc_observation else int(mdp_obs.get("connectivity_half_width", 2))
         if self.connectivity_half_width < 0:
             raise ValueError("connectivity_half_width must be nonnegative")
         self.connectivity_offsets = tuple(range(self.connectivity_half_width,
@@ -202,12 +216,17 @@ class SumoHighwayEnv(gym.Env):
             raise ValueError("signal_count must be at least 1")
         if self.signal_visibility <= 0:
             raise ValueError("signal_visibility must be positive")
+        self._guidance_geometry = {}
         self._signal_stop_offsets = {}
         self._signal_stop_lines = {}
-        if self.signal_enabled:
+        if self.signal_enabled or self.bc_observation:
             config = ET.parse(cfg_path).getroot()
             net_file = config.find("input/net-file").get("value")
             net = ET.parse(os.path.join(os.path.dirname(cfg_path), net_file)).getroot()
+            if self.bc_observation:
+                self._guidance_geometry = choice_geometry(net)
+                if self.ring_observation_enabled:
+                    self._ring_geometry = ring_geometry(net, self.ring_visibility)
             lane_offsets = {}
             for edge in net.findall("edge"):
                 offset = edge.find("stopOffset")
@@ -269,6 +288,25 @@ class SumoHighwayEnv(gym.Env):
         self.obs_dim += int(self.lane_change_margin_scale > 0)
         self.observation_space = spaces.Box(-1.0, 1.0, shape=(self.obs_dim,),
                                             dtype=np.float32)
+        if self.bc_observation:
+            self.obs_dim = 43
+            self.signal_distance_scale = float(mdp_obs.get("signal_distance_scale", 200.0))
+            self.guidance_distance_scale = float(mdp_obs.get("guidance_distance_scale", 650.0))
+            if not (np.isfinite(self.signal_distance_scale) and self.signal_distance_scale > 0
+                    and np.isfinite(self.guidance_distance_scale) and self.guidance_distance_scale > 0):
+                raise ValueError("Observation distance scales must be finite and positive")
+            low = np.full(43, -1.0, dtype=np.float32)
+            high = np.ones(43, dtype=np.float32)
+            low[31:] = 0.0
+            low[[37, 38, 41, 42]] = -1.0
+            # Distances are scaled, not saturated, even on a larger future road.
+            high[[34, 36, 40]] = np.inf
+            if self.ring_observation_enabled:
+                low = np.concatenate((low, [0, -1, 0, -1, 0, -1])).astype(np.float32)
+                high = np.concatenate((high, [1, np.inf, np.inf, np.inf, np.inf, np.inf])).astype(np.float32)
+                self.obs_dim = 49
+            self.observation_space = spaces.Box(low, high, dtype=np.float32)
+
 
     # ==================================================================
     # SUMO 프로세스 시작
@@ -478,7 +516,7 @@ class SumoHighwayEnv(gym.Env):
     _NEIGHBOR_MODES = {+1: (0b10, 0b00),   # 왼쪽: 선행=2, 후행=0
                        -1: (0b11, 0b01)}   # 오른쪽: 선행=3, 후행=1
 
-    def _neighbor(self, offset: int, leader: bool):
+    def _neighbor(self, offset: int, leader: bool, *, physical=False):
         """오프셋 차선(-1=오른쪽, 0=현재, +1=왼쪽)의 가장 가까운
         선행(leader=True)/후행 차량을 (거리 m, 그 차량 속도)로 반환.
         visibility 밖이거나 없으면 None."""
@@ -498,20 +536,29 @@ class SumoHighwayEnv(gym.Env):
             # 훑어 가장 가까운 앞/뒤를 찾음)으로 감지한다.
             front, rear = self._scan_lane_neighbors(offset)
             res = front if leader else rear
-            if res is None or res[0] < 0 or res[0] > self.visibility:
+            if res is None or (res[0] < 0 and not physical) or res[0] > self.visibility:
                 return None
-            return float(res[0]), float(res[1])
+            return float(max(res[0], 0) if physical else res[0]), float(res[1])
         else:
             mode_leader, mode_follower = self._NEIGHBOR_MODES[offset]
             pairs = self._api.vehicle.getNeighbors(
                 self.ego_id, mode_leader if leader else mode_follower)
             if not pairs:
                 return None
+            if physical:
+                pairs = [(vid, gap + self._api.vehicle.getMinGap(self.ego_id if leader else vid))
+                         for vid, gap in pairs if vid]
+                if not pairs:
+                    return None
             vid, gap = min(pairs, key=lambda p: p[1])   # 가장 가까운 차량
 
-        if not vid or gap < 0 or gap > self.visibility:
+        if not vid:
             return None
-        return float(gap), self._api.vehicle.getSpeed(vid)
+        if physical and offset == 0:
+            gap += self._api.vehicle.getMinGap(self.ego_id if leader else vid)
+        if (gap < 0 and not physical) or gap > self.visibility:
+            return None
+        return float(max(gap, 0) if physical else gap), self._api.vehicle.getSpeed(vid)
 
     def _lane_follows_route(self, lane_id, *, reference_edge=None) -> bool:
         """이 차선이 ego 경로의 '다음 도로'로 이어지면 True."""
@@ -590,7 +637,10 @@ class SumoHighwayEnv(gym.Env):
             remaining = self._api.lane.getLength(lane_id) - position
             if remaining > self.visibility:
                 return 1.0                    # 시야 내에선 계속 이어짐
-            if self._lane_follows_route(lane_id, reference_edge=reference_edge):
+            connected = (bool(self._api.lane.getLinks(lane_id))
+                         if getattr(self, "bc_observation", False) else
+                         self._lane_follows_route(lane_id, reference_edge=reference_edge))
+            if connected:
                 return 1.0                    # edge가 끝나도 내 경로의 다음 도로로 연결됨
             return float(np.clip(remaining / self.visibility, 0.0, 1.0))
         except self._api.TraCIException:
@@ -915,6 +965,12 @@ class SumoHighwayEnv(gym.Env):
                      if signal[3].lower() == "r"), None)
 
     def _signal_observation(self, signal):
+        if getattr(self, "bc_observation", False):
+            if signal is None or signal[2] > self.signal_visibility:
+                return [0.0] * 4
+            color = signal[3].lower()
+            return [float(color == c) for c in ("r", "y", "g")] + [
+                max(0.0, signal[2]) / self.signal_distance_scale]
         fine_scale = self.signal_fine_distance_scale
         if signal is None or signal[2] > self.signal_visibility:
             return [1.0, 0.0, 0.0, 0.0, 1.0] + ([1.0] if fine_scale > 0 else [])
@@ -943,11 +999,13 @@ class SumoHighwayEnv(gym.Env):
         return coef * float(np.clip(min(front_room, stop_room) / scale, 0.0, 1.0))
 
     def _red_park_penalty(self, red_signal, speed):
-        """Penalize slow movement beyond the upper edge of the red stop zone."""
+        """Penalize slow movement with room to approach the light or the queue."""
         coef = float(self.rw.get("red_park_penalty_coef", 0.0))
         if coef <= 0.0 or red_signal is None or speed > 2.0:
             return 0.0
-        remaining = red_signal[2] - float(self.rw.get("red_safe_zone_max_gap", 5.0))
+        leader_gap = self._leader_gap_before_signal(red_signal)
+        clearance = red_signal[2] if leader_gap is None else min(red_signal[2], leader_gap)
+        remaining = clearance - float(self.rw.get("red_safe_zone_max_gap", 5.0))
         return coef * min(max(remaining / 10.0, 0.0), 1.0)
 
     def _red_stop_close_penalty(self, red_signal):
@@ -1158,6 +1216,19 @@ class SumoHighwayEnv(gym.Env):
     def _destination_edge(self):
         return self._api.vehicle.getRoute(self.ego_id)[-1]
 
+    def observe_vehicle(self, vehicle_id):
+        """Use the policy's exact observation for a SUMO-controlled vehicle.
+
+        Observation queries are read-only. Call sequentially within one
+        simulator; separate processes must use their own environment instance.
+        """
+        original = self.ego_id
+        try:
+            self.ego_id = vehicle_id
+            return self._get_obs()
+        finally:
+            self.ego_id = original
+
     def _get_obs(self):
         # ego가 이미 사라졌다면(충돌/도착) 0벡터 반환 — 종료 직전 마지막 관측용
         if not self._ego_is_present():
@@ -1168,7 +1239,7 @@ class SumoHighwayEnv(gym.Env):
 
         # ----- 5개 차선(좌2→좌1→현재→우1→우2)의 선행/후행 상대거리·상대속도 -----
         for offset in self.obs_offsets:
-            lead = self._neighbor(offset, leader=True)
+            lead = self._neighbor(offset, leader=True, physical=self.neighbor_distance_mode == "bumper")
             if lead is None:
                 obs += [1.0, 1.0]                  # 없음: 멀고 + 위협 없음
             else:
@@ -1176,7 +1247,7 @@ class SumoHighwayEnv(gym.Env):
                 obs += [gap / self.visibility,
                         float(np.clip((lv - v) / self.vmax, -1.0, 1.0))]
 
-            foll = self._neighbor(offset, leader=False)
+            foll = self._neighbor(offset, leader=False, physical=self.neighbor_distance_mode == "bumper")
             if foll is None:
                 obs += [-1.0, -1.0]                # 없음: 멀고 + 위협 없음
             else:
@@ -1191,6 +1262,21 @@ class SumoHighwayEnv(gym.Env):
         # ----- 5개 차선의 전방 차량 밀도 (같은 순서) -----
         for offset in self.obs_offsets:
             obs.append(self._lane_density(offset))
+
+        if self.bc_observation:
+            # _upcoming_signals corrects getNextTLS distance using the controlled
+            # incoming lane's stopOffset: this is front bumper -> stop line,
+            # never Euclidean distance to the traffic-light pole.
+            signals = self._upcoming_signals() if self.signal_enabled else []
+            base = np.clip(np.asarray(obs, dtype=np.float32), -1.0, 1.0)
+            signal = self._signal_observation(signals[0] if signals else None)
+            navigation = navigation_observation(
+                self._api.vehicle, self.ego_id, self._guidance_geometry,
+                self.guidance_distance_scale)
+            extra = (ring_observation(self._api, self.ego_id, self._ring_geometry, self.vmax,
+                                      self.ring_distance_scale, self.ring_visibility)
+                     if self.ring_observation_enabled else [])
+            return np.concatenate((base, np.asarray(signal + navigation + extra, dtype=np.float32)))
 
         if self.signal_enabled:
             signals = self._upcoming_signals()
@@ -1276,8 +1362,9 @@ class SumoHighwayEnv(gym.Env):
         # 입구 보호구간은 ego 의 "첫 출발 도로"에서만 적용한다.
         #   (교차로 도로는 갈림점마다 구간이 잘게 나뉘는데, 그 구간들 시작마다 금지하면
         #    교차로 직전에서 차선을 아예 못 바꾼다. 새 차가 생겨나는 곳은 출발 도로 입구뿐.)
-        if (my_pos < self.lc_spawn_protect
-                and self._api.vehicle.getRouteIndex(self.ego_id) == 0):
+        if not lane_change_timing_allowed(
+                self._api.vehicle.getRoadID(self.ego_id), my_pos,
+                self._api.vehicle.getRouteIndex(self.ego_id), self.lc_spawn_protect):
             return False
 
         v = self._api.vehicle.getSpeed(self.ego_id)
@@ -1573,6 +1660,11 @@ class SumoHighwayEnv(gym.Env):
             reward += green_pass_reward
             self._rewarded_green_signals.update(green_passed)
 
+        metric_gap = ego_gap
+        if ego_speed is not None and self.neighbor_distance_mode == "bumper":
+            physical_leader = self._neighbor(0, leader=True, physical=True)
+            metric_gap = physical_leader[0] if physical_leader is not None else None
+
         info = {
             "route": self.ego_route_id,
             "collided": collided,
@@ -1600,7 +1692,7 @@ class SumoHighwayEnv(gym.Env):
             "signal_red_visible": red_visible,
             "signal_distance": signal_after[2] if signal_after is not None else None,
             "speed": ego_speed,
-            "gap": ego_gap,
+            "gap": metric_gap,
             "accel_raw": accel_raw,
             "lane_change_raw": lane_raw,
             "lane_change": lane_change,

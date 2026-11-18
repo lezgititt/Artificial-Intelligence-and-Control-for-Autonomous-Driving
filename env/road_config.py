@@ -84,9 +84,9 @@ NOHYEONG = {
     "central_lane_movements": {
         "A1": {0: [("A3", 0)],
                1: [("A2", 0), ("A5", 1)],
-               2: [("A2", 1), ("A5", 2)],
-               3: [("A2", 2), ("A5", 2)],
-               4: [("A4", 1), ("A1", 0)]},  # 0번 A3, 1~3번 A2/A5, 4번 좌회전·유턴
+               2: [("A2", 1)],
+               3: [("A2", 2)],
+               4: [("A4", 1), ("A1", 0)]},  # 0번 A3, 1번 A2/A5, 2~3번 A2, 4번 좌회전·유턴
         "A2": {1: [("A1", 0)], 2: [("A1", 1)], 3: [("A1", 2)],
                4: [("A3", 3)]},  # 0번은 nC에서 RING_A2_A4로 비신호 진출
         "A3": {0: [("A5", 0)], 1: [("A2", 0)],
@@ -230,6 +230,7 @@ SCENERY = {
 }
 
 EGO = {
+    "collision_gap_m": 0.2,  # Physical collision detection; separate from following minGap.
     "accel": 5.4,          # 최대 가속도 (m/s^2)  → 행동 a=+1 일 때
     "decel": 5.4,          # 최대 감속도 (m/s^2)  → 행동 a=-1 일 때
     "max_speed": 33.33,    # 차량 자체의 최고속도
@@ -244,12 +245,12 @@ EGO = {
 #    상황이 자연스럽게 만들어지도록 했다.
 # ──────────────────────────────────────────────────────────────
 TRAFFIC = {
+    "collision_gap_m": 0.2,  # Same explicit boundary for every expert/background model.
     # Right-turn demand is configured by NOHYEONG.ring_segments[*].vph.
     "right_turn_only_lane": True,
     "startup_spread_seconds": 60,  # 중앙 경로의 첫 출발을 60초에 걸쳐 분산
-    "prepare_departure_lanes": True,  # 중앙 회전 연결에 맞춰 출발 차선 배정
-    "lc_speed_gain": 0.0,  # 속도 이득만을 위한 잦은 차선 변경 억제
-    "lc_keep_right": 0.0,  # 우회전 전용 차선으로 돌아오는 경향 억제
+    "lc_speed_gain": 1.0,  # SUMO 기본 속도 이득 차선변경 허용
+    "lc_keep_right": 0.0,  # 우측 복귀 성향 비활성; 속도 이득 변경과 별개
     # ══════════════════════════════════════════════════════
     # ★ 추월 학습 시나리오 ★
     #
@@ -268,7 +269,7 @@ TRAFFIC = {
     "vehs_per_hour": 800,    # 시간당 투입 대수. 1500→1200 완화:
                               #   전체가 꽉 막힌 느낌을 줄이고
                               #   차선 사이 속도차/틈이 살아나게 한다
-    "depart_lane": "best",  # 경로에 맞는 출발 차선 선택: 우회전 전용 차선의 직진차 감소
+    "depart_lane": "random",  # 경로가 정해진 뒤 출발 도로의 차선을 무작위 선택
     # 배경차 차선변경 허용 여부 (컨트롤러별 "keep_lane" 이 없을 때의 기본값).
     #   직선 추월 예제에서는 True(차선 유지)였지만, 교차로에서는 좌/우회전 차선으로
     #   옮겨가야 하므로 False. (True 로 두면 엉뚱한 차선에서 멈춰 서서 정체가 생긴다)

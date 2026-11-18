@@ -30,6 +30,17 @@ class StopClearanceTests(unittest.TestCase):
             result = self.env.get_stop_clearance()
         self.assertEqual(result, {"stop_clearance_m": 3.0, "stop_reference": "stop_line"})
 
+    def test_red_park_penalty_does_not_penalize_a_safe_stop_behind_the_queue(self):
+        self.env.rw = {"red_park_penalty_coef": .1, "red_safe_zone_max_gap": 4.0}
+        signal = ("tls", 0, 20.0, "r")
+        with patch("env.sumo_env.traci", SimpleNamespace(vehicle=self.vehicle)):
+            self.vehicle.getLeader.return_value = ("leader", .5)  # 3 m between bumpers
+            self.assertEqual(self.env._red_park_penalty(signal, 0.0), 0.0)
+            self.vehicle.getLeader.return_value = ("leader", 4.5)  # 7 m between bumpers
+            self.assertAlmostEqual(self.env._red_park_penalty(signal, 0.0), .03)
+            self.vehicle.getLeader.return_value = ("leader", 29.)  # beyond the light
+            self.assertEqual(self.env._red_park_penalty(signal, 0.0), .1)
+
     def test_moving_ego_does_not_record_a_stop(self):
         self.vehicle.getSpeed.side_effect = lambda vid: 2.0
         with patch("env.sumo_env.traci", SimpleNamespace(vehicle=self.vehicle)):

@@ -45,8 +45,9 @@ SIGNAL_STOP_REWARDS = dict(
     red_safe_zone_first_reward=5.0,   # 적신호 안전 구역 최초 정차 보상
     red_safe_zone_hold_reward=0.005,  # 이후 안전 구역 유지 스텝당 보상
     red_safe_zone_hold_cap=0.2,       # 신호별 유지 보상 누적 상한
-    red_safe_zone_min_gap=2.5,
-    red_safe_zone_max_gap=4.0,
+    red_safe_zone_min_gap=1.5,
+    red_safe_zone_max_gap=3.0,
+    red_stop_margin=2.25,
     red_safe_zone_max_speed=0.1,
     red_safe_zone_dwell_seconds=1.0,
 )
@@ -60,6 +61,8 @@ def main():
                         help="초기 정책 가중치로 사용할 기존 model.pt")
     parser.add_argument("--num-envs", type=int, default=4096, help="전체 환경 수")
     parser.add_argument("--num-workers", type=int, default=4, help="학습용 SUMO 프로세스 수")
+    parser.add_argument("--focused-envs", type=int, default=0,
+                        help="Phase 2에서 실패율 기반 경로·교통량을 샘플링할 환경 수")
     parser.add_argument("--randomize-departures", choices=("True", "False"), default="False",
                         help="ego 출발 차선 랜덤화 (기본 False: 도로 설정의 차선으로 고정)")
     parser.add_argument("--steps-per-env", type=int, default=24)
@@ -90,8 +93,15 @@ def main():
     parser.add_argument("--results-dir", type=Path, default=Path(BASE) / RESULTS_DIR)
     parser.add_argument("--no-red-stop-hold-reward", action="store_true",
                         help="적신호 정차 유지 가점 비활성화")
+    parser.add_argument("--arrival-bonus", type=float, default=REWARD["arrival_bonus"],
+                        help="경로 완주 시 받는 가점")
+    parser.add_argument("--red-safe-zone-first-reward", type=float,
+                        default=SIGNAL_STOP_REWARDS["red_safe_zone_first_reward"],
+                        help="적신호 목표 구간에 최초 정차할 때의 가점")
     parser.add_argument("--no-green-stop-penalty", action="store_true",
                         help="청신호 정차 감점 비활성화")
+    parser.add_argument("--no-blocked-penalty", action="store_true",
+                        help="느린 앞차 뒤에 있을 때의 막힘 감점 비활성화")
     parser.add_argument("--red-park-penalty-coef", type=float, default=0.10,
                         help="적신호 저속 거리 감점의 스텝당 상한, 0이면 비활성화")
     parser.add_argument("--red-speed-tracking-cap", type=float,
@@ -108,6 +118,14 @@ def main():
     parser.add_argument("--signal-fine-distance-scale", type=float, default=0.0,
                         help="신호별 정밀 거리 관측 범위(m), 0이면 비활성화")
     args = parser.parse_args()
+    if not 0 <= args.focused_envs <= args.num_envs or (args.focused_envs and args.phase != 2):
+        parser.error("--focused-envs는 Phase 2에서만 전체 환경 수 범위 내로 지정해야 합니다.")
+    if args.num_workers > 0 and args.focused_envs % args.num_workers:
+        parser.error("--focused-envs는 워커 수의 배수여야 합니다.")
+    if not 0 <= args.arrival_bonus < float("inf"):
+        parser.error("--arrival-bonus는 유한한 0 이상의 값이어야 합니다.")
+    if not 0 <= args.red_safe_zone_first_reward < float("inf"):
+        parser.error("--red-safe-zone-first-reward는 유한한 0 이상의 값이어야 합니다.")
     if not 0 <= args.target_kl < float("inf"):
         parser.error("--target-kl은 유한한 0 이상의 값이어야 합니다.")
     if args.lookahead_edges < 1:
@@ -154,11 +172,12 @@ def main():
     minibatches_per_epoch = rollout_steps // args.minibatch_size
 
     road_config.configure_parallel_training(args.phase)
-    curriculum = TrafficCurriculum() if args.phase == 2 else None
+    curriculum = (TrafficCurriculum(max_vph=3000, total_vph=True, snapshot_warmup_seconds=250,
+                                    max_depart_delay_seconds=125, ring_reference_vph=1500)
+                  if args.phase == 2 else None)
     signal_rewards = dict(SIGNAL_STOP_REWARDS)
-    if args.phase == 1:
-        signal_rewards.update(red_safe_zone_min_gap=1.5, red_safe_zone_max_gap=3.0,
-                              red_stop_margin=2.25)
+    signal_rewards["arrival_bonus"] = args.arrival_bonus
+    signal_rewards["red_safe_zone_first_reward"] = args.red_safe_zone_first_reward
     signal_rewards["red_park_penalty_coef"] = args.red_park_penalty_coef
     signal_rewards["red_speed_tracking_cap"] = args.red_speed_tracking_cap
     signal_rewards["red_speed_tracking_approach_only"] = args.red_speed_tracking_approach_only
@@ -169,6 +188,8 @@ def main():
         signal_rewards["red_safe_zone_hold_reward"] = 0.0
     if args.no_green_stop_penalty:
         signal_rewards["green_stop_penalty"] = 0.0
+    if args.no_blocked_penalty:
+        signal_rewards["blocked_penalty"] = 0.0
     reward = {**REWARD, **signal_rewards}
     observation = dict(OBSERVATION, destination_enabled=False, signal_count=1, signal_enabled=True)
     observation["signal_fine_distance_scale"] = args.signal_fine_distance_scale
@@ -224,14 +245,19 @@ def main():
             "early_lane_change_bonus": args.early_lane_change_bonus,
             "lane_keep_bias": args.lane_keep_bias,
             "signal_fine_distance_scale": args.signal_fine_distance_scale,
+            "arrival_bonus": args.arrival_bonus,
+            "red_safe_zone_first_reward": signal_rewards["red_safe_zone_first_reward"],
             "red_stop_hold_reward": signal_rewards["red_safe_zone_hold_reward"],
             "green_stop_penalty": signal_rewards["green_stop_penalty"],
+            "blocked_penalty": reward["blocked_penalty"],
             "red_park_penalty_coef": args.red_park_penalty_coef,
             "red_speed_tracking_cap": args.red_speed_tracking_cap,
             "yellow_tracking_max_decel": args.yellow_tracking_max_decel,
             "red_speed_tracking_approach_only": signal_rewards["red_speed_tracking_approach_only"],
             "independent_episode_rng": True,
             "traffic_curriculum": asdict(curriculum) if curriculum else None,
+            "fixed_training_routes": args.phase == 2,
+            "focused_envs": args.focused_envs,
             "periodic_eval_traffic_vph": 800 if curriculum and args.eval_interval else 0,
             "ring_route_probability": road_config.NOHYEONG["ego_routes"]["ring_prob"],
             "initialization": "random" if args.init_model is None else str(args.init_model),
@@ -247,7 +273,12 @@ def main():
     template = ParallelSumo(envs_per_worker, env_kwargs, run_dir / "parallel", hparams["seed"],
                             randomize_signals=True, randomize_departures=randomize_departures,
                             independent_episode_rng=True,
-                            traffic_curriculum=curriculum)
+                            traffic_curriculum=curriculum, fixed_training_routes=args.phase == 2,
+                            focused_envs=args.focused_envs // args.num_workers)
+    if template.fixed_training_routes:
+        (run_dir / "training_routes.json").write_text(
+            json.dumps(template.training_route_assignments(args.num_envs), indent=2) + "\n",
+            encoding="utf-8")
     env = template if args.num_workers == 1 else ShardedParallelSumo(template, args.num_workers)
     agent = ParallelPPO(obs_dim=env.prototype.obs_dim, act_dim=env.prototype.act_dim, **hparams)
     if args.init_model is not None:
@@ -262,6 +293,8 @@ def main():
     if args.eval_interval:
         # Share the generated network files. The worker owns its own simulator.
         eval_env = deepcopy(template)
+        eval_env.fixed_training_routes = False
+        eval_env.focus = None
         eval_env.seed += 1
         if curriculum is not None:
             eval_env.fixed_traffic_vph = 800
@@ -292,6 +325,9 @@ def main():
         finally:
             logger.close()
     agent.save(run_dir / "model.pt")
+    if template.focus is not None:
+        (run_dir / "focus_statistics.json").write_text(
+            json.dumps(template.focus.summary(), indent=2) + "\n", encoding="utf-8")
     print(f"저장 완료: {run_dir / 'model.pt'}")
 
 

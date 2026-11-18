@@ -86,13 +86,17 @@ SIMULATION = {
 # 목적지 도로 one-hot [54:59]: A1, A2, A3, A4, A5. 전체 59차원.
 # lookahead_connectivity_enabled=False이면 기존 50차원 레이아웃을 유지한다.
 OBSERVATION = {
-    "connectivity_half_width": 4,  # 연결성만 ±4차선; 차량/밀도는 기존 ±2차선 유지
-    "lookahead_connectivity_enabled": True,
-    "destination_enabled": True,
+    "neighbor_distance_mode": "bumper",  # Physical bumper gaps; retain close/overlapping vehicles.
+    "layout": "bc43",  # 31 basic + 4 stop-line signal + 2 x 4 road navigation
+    "signal_distance_scale": 200.0,
+    "guidance_distance_scale": 650.0,
+    "connectivity_half_width": 2,  # 차량/연결성/밀도 모두 좌우 2차선
+    "lookahead_connectivity_enabled": False,
+    "destination_enabled": False,
     "destination_arms": ("A1", "A2", "A3", "A4", "A5"),
     "signal_enabled": SIGNAL_EXPERIMENT,
-    "signal_visibility": 100.0,
-    "signal_count": 2,
+    "signal_visibility": 100.0,  # 관측 범위. 정규화 기준 200m와 별개.
+    "signal_count": 1,
     "visibility": 50.0,          # 관측 가능 거리 W (m). 앞뒤 차량 감지와
                                  # 상대거리/연결성/밀도 정규화의 기준.
     "density_veh_length": 7.5,   # 밀도 계산 시 차량 1대의 점유 길이 (m)
@@ -142,7 +146,7 @@ ACTION = {
         "rear_tau": 0.3,        # s (후행차 속도 기준)
         "approach_horizon": 0.6,  # s. 접근 여유 판정 시간 — "이 시간 안에
                                   # 상대와 만나면 위험". 짧을수록 공격적.
-        "spawn_protect": 60.0,  # m. 도로 시작 이 구간 안에서는 변경 금지.
+        "spawn_protect": 30.0,  # m. 도로 시작 이 구간 안에서는 변경 금지.
                                 # flow가 입구에서 새 차를 만드는데 "생성 직전"
                                 # 차량은 관측 불가라 원천 사각지대이기 때문.
     },

@@ -1,6 +1,7 @@
 """Per-road background traffic for the shared SUMO clock."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from math import gcd
 
 import numpy as np
 
@@ -12,10 +13,25 @@ class TrafficCurriculum:
     success_increment: int = 50
     failure_decrement: int = 150
     ring_traffic: bool = True
+    total_vph: bool = False
+    snapshot_warmup_seconds: int = 0
+    max_depart_delay_seconds: int | None = None
+    ring_reference_vph: int | None = None
+
+    def sumo_options(self):
+        if self.max_depart_delay_seconds is None:
+            return []
+        return ["--max-depart-delay", str(self.max_depart_delay_seconds)]
 
     def after_episode(self, vph, success):
         delta = self.success_increment if success else -self.failure_decrement
         return min(self.max_vph, max(0, vph + delta))
+
+    def snapshot_levels(self, fixed_vph):
+        if fixed_vph is not None:
+            return (fixed_vph,) if fixed_vph else ()
+        spacing = gcd(self.initial_vph, self.max_vph, self.success_increment, self.failure_decrement)
+        return tuple(range(spacing, self.max_vph + 1, spacing)) if spacing else ()
 
 
 @dataclass(frozen=True)
@@ -50,13 +66,18 @@ def parse_traffic_flows(flows, routes, net_path, central_vph, curriculum):
                     raise ValueError(f"No background route for {flow.get('id')}: {start} -> {end}")
                 edges.extend(edge.getID() for edge in (path if not edges else path[1:]))
             routes[route] = edges
-        # Ring traffic scales from zero to its road-config demand at the curriculum cap.
-        reference = curriculum.max_vph if ring else central_vph
+        # Keep route proportions stable when the total-demand limit changes.
+        ring_reference = curriculum.ring_reference_vph or curriculum.max_vph
+        reference = ring_reference if ring else central_vph
         result.append(TrafficFlow(route, flow.get("type"), flow.get("departLane", "best"),
                                   flow.get("departSpeed", "0"),
                                   3600 / float(flow.get("period")) / reference))
     if not result:
         raise ValueError("Background traffic requires a road with demand templates")
+    if curriculum.total_vph:
+        total = sum(flow.rate_per_central_vph for flow in result)
+        result = [replace(flow, rate_per_central_vph=flow.rate_per_central_vph / total)
+                  for flow in result]
     return tuple(result)
 
 
@@ -70,6 +91,16 @@ class TrafficSchedule:
         self.next_departure = float("inf")
         self.vph = 0
         self.serial = 0
+
+    def restore(self, api, prefix, vehicles):
+        for route, vehicle_type, lane, position, speed, speed_factor, _ in vehicles:
+            vehicle = prefix(f"bg_{self.serial}")
+            self.serial += 1
+            api.vehicle.add(vehicle, prefix(route), typeID=vehicle_type)
+            api.vehicle.moveTo(vehicle, prefix(lane), position)
+            api.vehicle.setSpeedFactor(vehicle, speed_factor)
+            api.vehicle.setPreviousSpeed(vehicle, speed)
+            self.ids.add(vehicle)
 
     def reset(self, api, now, vph, rng, live_ids):
         if self.ids:
@@ -92,3 +123,43 @@ class TrafficSchedule:
                             departLane=flow.lane, departSpeed=flow.speed)
             self.ids.add(vehicle)
             self.next_departure += self._headway(rng)
+
+
+class TrafficFocus:
+    """Sample route/demand pairs in proportion to their recent failure estimates."""
+
+    levels = (1500, 2000, 2500, 3000)
+
+    def __init__(self, routes):
+        self.routes = tuple(routes)
+        self.index = {pair: i for i, pair in enumerate(
+            (route, vph) for route in self.routes for vph in self.levels)}
+        self.pairs = tuple(self.index)
+        self.pending = np.zeros((len(self.pairs), 2), dtype=np.int64)
+        self.total = self.pending.copy()
+        self.recent = self.pending.astype(float)
+        self.weights = np.full(len(self.pairs), 1 / len(self.pairs))
+
+    def sample(self, rng):
+        return self.pairs[rng.choice(len(self.pairs), p=self.weights)]
+
+    def record(self, route, vph, success):
+        self.pending[self.index[route, vph], int(not success)] += 1
+
+    def drain(self):
+        result = self.pending.copy()
+        self.pending.fill(0)
+        return result
+
+    def update(self, counts):
+        self.total += counts
+        self.recent *= .98
+        self.recent += counts
+        # Eight virtual episodes at 50% failure stabilize small samples.
+        failure = (self.recent[:, 1] + 4) / (self.recent.sum(axis=1) + 8)
+        self.weights = failure / failure.sum()
+
+    def summary(self):
+        return [{"route": route, "traffic_vph": vph, "episodes": int(counts.sum()),
+                 "failures": int(counts[1]), "sampling_probability": float(weight)}
+                for (route, vph), counts, weight in zip(self.pairs, self.total, self.weights, strict=True)]

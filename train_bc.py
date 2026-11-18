@@ -12,7 +12,7 @@ BCPolicy는 algorithms/bc.py에 정의된
 state_dim -> 256 -> 256 -> action_dim MLP를 사용하며,
 전체 action vector에 대해 MSE loss로 학습함.
 
-TensorBoard 이벤트 파일은 model.pt와 같은 run 폴더(results/bc_월일_시분/)에
+TensorBoard 이벤트 파일은 model.pt와 같은 run 폴더(results/BC_YYYYMMDD_HHMMSS/)에
 바로 저장되므로, train.py의 run_* 결과와 나란히 비교할 수 있다.
 """
 
@@ -20,7 +20,6 @@ import argparse
 import csv
 import json
 from contextlib import closing
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -29,9 +28,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from algorithms.bc import BCPolicy
-
-
-BASE = Path(__file__).resolve().parent
+from utils.bc_results import create_bc_result_dir
 
 
 def load_data(path):
@@ -309,19 +306,7 @@ def main():
         lr=args.lr,
     )
 
-    # 결과 폴더 — 짧고 읽기 쉬운 이름: bc_월일_시분 (예: bc_0922_1145)
-    # 같은 분(minute)에 여러 번 실행하면 _2, _3 … 접미사가 자동으로 붙는다.
-    if args.out_dir is None:
-        stem = datetime.now().strftime("bc_%m%d_%H%M")
-        out_dir = BASE / "results" / stem
-        k = 2
-        while out_dir.exists():
-            out_dir = BASE / "results" / f"{stem}_{k}"
-            k += 1
-    else:
-        out_dir = args.out_dir
-
-    out_dir.mkdir(parents=True, exist_ok=False)
+    out_dir = create_bc_result_dir(args.out_dir)
 
     # 설정 저장
     config = {
