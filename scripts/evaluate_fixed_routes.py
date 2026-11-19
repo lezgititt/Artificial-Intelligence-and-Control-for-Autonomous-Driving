@@ -1,6 +1,7 @@
 """Prepare and evaluate a shared fixed-center, 24-route SUMO benchmark."""
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import closing
 import csv
 from dataclasses import asdict, replace
 import hashlib
@@ -90,12 +91,12 @@ def prepare(suite, reference, traffic_vph):
                                capture_steps=[int(time / STEP) for time in SNAPSHOT_TIMES])
     try:
         destination = suite / "traffic_states.sqlite"
-        with sqlite3.connect(bank.path) as source, sqlite3.connect(destination) as target:
+        with closing(sqlite3.connect(bank.path)) as source, closing(sqlite3.connect(destination)) as target:
             source.backup(target)
     finally:
         bank.close()
     cases = []
-    with sqlite3.connect(destination) as db:
+    with closing(sqlite3.connect(destination)) as db:
         signal_ticks = dict(db.execute("SELECT snapshot_tick, signal_tick FROM signal_ticks"))
         for worker, times in enumerate(np.array_split(SNAPSHOT_TIMES, 4)):
             for value in times:
@@ -190,10 +191,53 @@ class FixedCaseSumo(ParallelSumo):
             delta = (vehicle.getLaneIndex(vid) - lane
                      if ego.present and vehicle.getRoadID(vid) == edge and not edge.startswith(":") else 0)
             state = (0., delta, delta, bool(delta), lane, speed, signals, connected, distance, None)
-            yield ego._finish_step(state, collided=vid in collided, arrived=vid in arrived)
+            transition = ego._finish_step(state, collided=vid in collided, arrived=vid in arrived)
+            if ego.replica_index in getattr(self, 'audit_before', {}):
+                # Capture before step_evaluation removes a terminated vehicle.
+                self.audit_after[ego.replica_index] = audit_state(
+                    ego, self.audit_before[ego.replica_index].get('signals', []))
+            yield transition
 
 
-def evaluate_worker(suite, context, scratch, cases, expert_type, replicas):
+def audit_state(ego, reference_signals=()):
+    """Read-only diagnostics; do not alter vehicle controls or consume RNG."""
+    vehicle = libsumo.vehicle
+    signal_states = [dict(tls=s['tls'], link=s['link'],
+                         state=libsumo.trafficlight.getRedYellowGreenState(s['tls'])[s['link']])
+                     for s in reference_signals]
+    if not ego.present:
+        return dict(present=False, reference_signal_states=signal_states)
+    vid = ego.ego_id
+    lane = vehicle.getLaneID(vid)
+    route = vehicle.getRoute(vid)
+    index = vehicle.getRouteIndex(vid)
+    signals = []
+    for tid, link, distance, state in vehicle.getNextTLS(vid):
+        key = tid, link
+        offset = ego._signal_stop_offsets.get(key, 0.)
+        signals.append(dict(tls=tid, link=link, raw_distance=distance, offset=offset,
+                            adjusted_distance=distance-offset, state=state,
+                            stop_line=ego._signal_stop_lines.get(key)))
+    leader = vehicle.getLeader(vid, 1e6)
+    leader_data = None
+    if leader and leader[0]:
+        other, gap = leader
+        leader_data = dict(vehicle=other, gap=gap, speed=vehicle.getSpeed(other),
+                           lane=vehicle.getLaneID(other), route=vehicle.getRouteID(other),
+                           signals=vehicle.getNextTLS(other))
+    connected = ego._lane_follows_route(lane)
+    lc = None
+    if not connected and vehicle.getSpeed(vid) < .5 and not lane.startswith(':'):
+        lc = {str(direction): vehicle.getLaneChangeStatePretty(vid, direction) for direction in (-1, 1)}
+    return dict(present=True, time=libsumo.simulation.getTime(), road=vehicle.getRoadID(vid), lane=lane,
+                position=vehicle.getLanePosition(vid), remaining=libsumo.lane.getLength(lane)-vehicle.getLanePosition(vid),
+                speed=vehicle.getSpeed(vid), distance=vehicle.getDistance(vid), route_index=index,
+                next_edge=route[index+1] if 0 <= index < len(route)-1 else None,
+                connected=connected, signals=signals, leader=leader_data, lane_change=lc,
+                reference_signal_states=signal_states)
+
+
+def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace_ids=()):
     import torch
 
     torch.set_num_threads(1)
@@ -233,7 +277,11 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas):
     queue = iter(range(len(cases)))
     active = {slot: next(queue) for slot in range(env.num_envs)}
     completed = 0
+    trace_ids = set(trace_ids)
+    trace_file = None
     try:
+        if trace_ids:
+            trace_file = (scratch.parent / f'{scratch.name}_trace.jsonl').open('w', encoding='utf-8')
         obs = env.reset([cases[j]["route"] for j in active.values()],
                         signal_ticks=[cases[j]["tick"] for j in active.values()],
                         snapshot_ticks=[cases[j].get("snapshot_tick", cases[j]["tick"]) for j in active.values()],
@@ -245,9 +293,19 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas):
             with torch.inference_mode():
                 actions = (policy.det_action(torch.from_numpy(obs[slots])).numpy() if policy is not None
                            else np.zeros((len(slots), env.prototype.act_dim), np.float32))
+            traced = {slot: audit_state(env.egos[slot]) for slot in slots
+                      if cases[active[slot]]['case_id'] in trace_ids}
+            env.audit_before = traced
+            env.audit_after = {}
             transitions = list(env.step_evaluation(slots, actions))
             for slot, (x, reward, terminated, truncated, info) in zip(slots, transitions, strict=True):
                 index = active[slot]
+                if slot in traced:
+                    trace_file.write(json.dumps(dict(case_id=cases[index]['case_id'],
+                        step=env.egos[slot].step_count, before=traced[slot],
+                        after=env.audit_after[slot] if slot in env.audit_after else audit_state(env.egos[slot]),
+                        terminated=terminated, truncated=truncated,
+                        flags={key: info.get(key) for key in ('arrived', 'collided', 'wrong_lane', 'red_light_violation')})) + '\n')
                 records.record(index, reward, truncated, info)
                 if not (terminated or truncated):
                     obs[slot] = x
@@ -270,6 +328,8 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas):
         rows = parallel_route_rows(records, env.prototype.visibility, env.prototype.step_length)
         return [case | row for case, row in zip(cases, rows, strict=True)]
     finally:
+        if trace_file is not None:
+            trace_file.close()
         env.close()
 
 
@@ -329,7 +389,7 @@ def plot_summary(out, label, rows, summary, routes, model_run):
     plt.close(fig)
 
 
-def run(suite, label, expert, model, replicas, smoke):
+def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None):
     started = perf_counter()
     reference = suite / "reference"
     spec = read_json(suite / "suite.json")
@@ -345,10 +405,14 @@ def run(suite, label, expert, model, replicas, smoke):
     shards = [[c for c in cases if c["worker"] == worker] for worker in range(4)]
     if smoke:
         shards = [shard[:smoke] for shard in shards]
+    trace_ids = []
+    if trace_failures_from is not None:
+        with (trace_failures_from / 'route_evaluation.csv').open(newline='') as file:
+            trace_ids = [int(row['case_id']) for row in csv.DictReader(file) if row['status'] != 'arrival']
     print(f"{label}: {sum(map(len, shards)):,} cases, {replicas} replicas/worker", flush=True)
     with ProcessPoolExecutor(4, mp_context=get_context("spawn")) as pool:
         futures = [pool.submit(evaluate_worker, suite, context, out / f"worker_{i}",
-                               shard, expert, replicas) for i, shard in enumerate(shards)]
+                               shard, expert, replicas, trace_ids) for i, shard in enumerate(shards)]
         rows = sorted((row for job in as_completed(futures) for row in job.result()), key=lambda r: r["case_id"])
     expected = {c["case_id"] for shard in shards for c in shard}
     if len(rows) != len(expected) or {r["case_id"] for r in rows} != expected:
@@ -365,6 +429,13 @@ def run(suite, label, expert, model, replicas, smoke):
                    conditions=spec | {"replicas_per_worker": replicas}, overall=summarize(rows),
                    by_route={route: summarize([r for r in rows if r["route"] == route]) for route in routes},
                    elapsed_seconds=round(perf_counter() - started, 2))
+    if trace_failures_from is not None:
+        with (trace_failures_from / 'route_evaluation.csv').open(newline='') as file:
+            previous = {int(row['case_id']): row for row in csv.DictReader(file)}
+        mismatches = [dict(case_id=row['case_id'], original=previous[row['case_id']]['status'], replay=row['status'])
+                      for row in rows if previous[row['case_id']]['status'] != row['status']]
+        summary['audit_replay'] = dict(source=str(trace_failures_from), traced_cases=len(trace_ids),
+                                      status_mismatches=mismatches)
     write_json(out / "evaluation_summary.json", summary)
     with (out / "route_evaluation.csv").open("w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0]), lineterminator="\n")
@@ -390,6 +461,8 @@ def main():
     evaluate.add_argument("--replicas", type=int, default=MAX_REPLICAS_PER_WORKER,
                           help=f"Replicas per worker (default and maximum: {MAX_REPLICAS_PER_WORKER})")
     evaluate.add_argument("--smoke", type=int, default=0, help="Use only the first N cases per worker")
+    evaluate.add_argument('--trace-failures-from', type=Path,
+                          help='Replay every case in its original order, logging failed case steps from this result directory')
     args = parser.parse_args()
     suite = args.suite.resolve()
     if args.command == "prepare":
@@ -399,8 +472,11 @@ def main():
     else:
         if not 1 <= args.replicas <= MAX_REPLICAS_PER_WORKER or args.smoke < 0:
             parser.error(f"Expected 1–{MAX_REPLICAS_PER_WORKER} replicas and a nonnegative smoke-test count")
+        if args.trace_failures_from is not None and args.expert is None:
+            parser.error('--trace-failures-from currently requires --expert')
         run(suite, args.label, args.expert, args.model.resolve(strict=True) if args.model else None,
-            args.replicas, args.smoke)
+            args.replicas, args.smoke,
+            args.trace_failures_from.resolve(strict=True) if args.trace_failures_from else None)
 
 
 if __name__ == "__main__":
