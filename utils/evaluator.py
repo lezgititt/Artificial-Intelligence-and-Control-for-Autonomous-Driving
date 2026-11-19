@@ -73,6 +73,9 @@ class _EpisodeStats:
     start_lane: int | None = None
     first_lane_change_edge: str | None = None
     first_lane_change_position_m: float | None = None
+    first_right_change_step: int | None = None
+    first_right_change_edge: str | None = None
+    first_right_change_position_m: float | None = None
     signal_offset_s: float | None = None
     traffic_vph: int | None = None
     speeds: list[float] = field(default_factory=list)
@@ -94,6 +97,12 @@ class _DrivingStats:
                 and info.get("lane_after") is not None and info.get("lane_change")):
             stats.first_lane_change_edge = info.get("lane_change_edge")
             stats.first_lane_change_position_m = info.get("lane_change_position_m")
+        if (stats.first_right_change_step is None and info.get("lane_change") == -1
+                and info.get("lane_change_applied") and info.get("lane_after") is not None
+                and info["lane_after"] == info["lane_before"] - 1):
+            stats.first_right_change_step = stats.length - 1
+            stats.first_right_change_edge = info.get("lane_change_edge")
+            stats.first_right_change_position_m = info.get("lane_change_position_m")
         stats.green_passes += int(info.get("green_pass_count", info.get("green_pass_reward", 0.0) > 0))
         stats.red_stop_cost += float(info.get("red_stop_penalty", 0.0))
         if "stop_clearance_m" in info:
@@ -217,12 +226,20 @@ def evaluate_parallel_policy(policy, env, device):
 def evaluate_parallel_routes(policy, env, device, routes, **reset_options):
     """Run one episode for each explicit route and return results in route order."""
     stats = _run_parallel_episodes(policy, env, device, routes, **reset_options)
+    return parallel_route_rows(stats, env.prototype.visibility, env.prototype.step_length)
+
+
+def parallel_route_rows(stats, visibility, step_length):
     statuses = {"arrived": "arrival", "collided": "collision", "red_light_violation": "red_light"}
     return [
         {"status": statuses.get(episode.outcome, episode.outcome or "unknown"),
          "start_lane": episode.start_lane, "signal_offset_s": episode.signal_offset_s,
          "first_lane_change_edge": episode.first_lane_change_edge,
          "first_lane_change_position_m": episode.first_lane_change_position_m,
+         "first_right_change_s": (None if episode.first_right_change_step is None else
+                                  episode.first_right_change_step * step_length),
+         "first_right_change_edge": episode.first_right_change_edge,
+         "first_right_change_position_m": episode.first_right_change_position_m,
          "traffic_vph": episode.traffic_vph,
          "last_stop_clearance_m": episode.last_stop_clearance_m,
          "last_stop_reference": episode.last_stop_reference,
@@ -231,8 +248,8 @@ def evaluate_parallel_routes(policy, env, device, routes, **reset_options):
          "first_signal_stop_clearance_m": episode.first_signal_stop_clearance_m,
          "green_restart_observed": episode.green_restart_start_step is not None,
          "green_restart_delay_s": (None if episode.green_restart_steps is None else
-                                   episode.green_restart_steps * env.prototype.step_length),
-         **stats.metrics(env.prototype.visibility, [episode]).as_dict()}
+                                   episode.green_restart_steps * step_length),
+         **stats.metrics(visibility, [episode]).as_dict()}
         for episode in stats.episodes
     ]
 

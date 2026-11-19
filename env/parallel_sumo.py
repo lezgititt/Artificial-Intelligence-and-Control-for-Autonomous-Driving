@@ -58,6 +58,7 @@ def _write_network(net, destination, count):
     xmin, ymin, xmax, ymax = map(float, location.get("convBoundary").split(","))
     stride_x, stride_y = xmax - xmin + 100, ymax - ymin + 100
     width = min(count, 32)
+    offsets = [(i % width * stride_x, i // width * stride_y) for i in range(count)]
     bounds = f"{xmin},{ymin},{xmax + (width - 1) * stride_x},{ymax + ((count - 1) // width) * stride_y}"
     location.set("convBoundary", bounds)
     location.set("origBoundary", bounds)
@@ -67,8 +68,7 @@ def _write_network(net, destination, count):
         file.write(ET.tostring(location, encoding="utf-8"))
         for tag in groups:
             templates = net.findall(tag)
-            for index in range(count):
-                dx, dy = index % width * stride_x, index // width * stride_y
+            for index, (dx, dy) in enumerate(offsets):
                 for template in templates:
                     element = deepcopy(template)
                     for node in element.iter():
@@ -87,6 +87,7 @@ def _write_network(net, destination, count):
                                 node.set(attr, " ".join(points))
                     file.write(ET.tostring(element, encoding="utf-8"))
         file.write(b"</net>\n")
+    return offsets
 
 
 def _build_replicas(config, directory, count, step_length, randomize_signals,
@@ -115,7 +116,7 @@ def _build_replicas(config, directory, count, step_length, randomize_signals,
     traffic_flows = (parse_traffic_flows(flows, original_routes, net_path, reference_vph, traffic_curriculum)
                      if traffic_curriculum is not None else ())
     signal_ids, signal_end_ticks = _signal_schedule(source, step_length, randomize_signals)
-    _write_network(source, net, count)
+    offsets = _write_network(source, net, count)
     route_xml = ET.Element("routes")
     route_xml.extend(types)
     for index in range(count):
@@ -130,7 +131,8 @@ def _build_replicas(config, directory, count, step_length, randomize_signals,
     ET.SubElement(inputs, "route-files", value=routes.name)
     result = directory / "parallel.sumocfg"
     ET.ElementTree(root).write(result, encoding="utf-8")
-    return str(result), ego_routes, signal_ids, signal_end_ticks, traffic_flows, group_unique_ego_routes(original_routes)
+    return (str(result), ego_routes, signal_ids, signal_end_ticks, traffic_flows,
+            group_unique_ego_routes(original_routes), offsets)
 
 
 class _ReplicaEgo(SumoHighwayEnv):
@@ -167,6 +169,7 @@ class ParallelSumo:
     def __init__(self, num_envs, env_kwargs, directory, seed, *, randomize_signals=False,
                  randomize_departures=False, independent_episode_rng=False,
                  traffic_curriculum=None, fixed_traffic_vph=None, traffic_snapshot_path=None,
+                 uniform_route_departures=False,
                  fixed_training_routes=False, focused_envs=0):
         if num_envs < 1:
             raise ValueError("num_envs must be positive")
@@ -176,6 +179,10 @@ class ParallelSumo:
         self.independent_episode_rng = independent_episode_rng or randomize_departures
         self.traffic_curriculum = traffic_curriculum
         self.fixed_traffic_vph = fixed_traffic_vph
+        self.uniform_route_departures = uniform_route_departures
+        self.route_departure_options = ()
+        if uniform_route_departures and (not randomize_departures or fixed_training_routes or focused_envs):
+            raise ValueError("Uniform route departures require randomized lanes and routes")
         self.fixed_training_routes = fixed_training_routes
         self.focused_envs = focused_envs
         self._snapshot_config = env_kwargs["cfg_path"]
@@ -197,7 +204,7 @@ class ParallelSumo:
         if randomize_signals and not self.prototype.signal_enabled:
             raise ValueError("Randomized signals require signal observations")
         (self.config, self.route_entries, self.signal_ids, self.signal_end_ticks,
-         self.traffic_flows, self.route_groups) = (
+         self.traffic_flows, self.route_groups, self.network_offsets) = (
             _build_replicas(env_kwargs["cfg_path"], directory, num_envs, self.prototype.step_length,
                             randomize_signals, traffic_curriculum,
                             self.prototype.traffic.get("vehs_per_hour", 0)))
@@ -305,11 +312,15 @@ class ParallelSumo:
         rng.shuffle(routes)
         return routes
 
-    def _respawn(self, ego, route=None, traffic_vph=None, signal_tick=None):
+    def _respawn(self, ego, route=None, traffic_vph=None, signal_tick=None, snapshot_tick=None):
         if ego.present:
             libsumo.vehicle.remove(ego.ego_id)
         if route is None:
             route = ego.fixed_training_route
+        departure = None
+        if route is None and self.uniform_route_departures:
+            route, departure = self.route_departure_options[
+                ego.np_random.integers(len(self.route_departure_options))]
         if route is None:
             route = ego._sample_ego_route(self.route_groups) if ego.ego_route_random else "r0"
         ego.signal_offset_s = None
@@ -326,7 +337,9 @@ class ParallelSumo:
                 libsumo.trafficlight.setPhase(tls_id, phase)
                 libsumo.trafficlight.setPhaseDuration(tls_id, remaining)
         candidates = self.departures[route]
-        lane, position, lane_index = candidates[ego.lane_random.integers(len(candidates))]
+        if departure is None:
+            departure = candidates[ego.lane_random.integers(len(candidates))]
+        lane, position, lane_index = departure
         ego.start_lane = lane_index
         if ego.background is not None:
             vph = ego.background.vph if traffic_vph is None else traffic_vph
@@ -335,7 +348,8 @@ class ParallelSumo:
             if vph and self._snapshot_db is not None:
                 clearance = (libsumo.vehicletype.getLength("ego_type")
                              + libsumo.vehicletype.getMinGap("ego_type"))
-                vehicles = pick_snapshot(self._snapshot_db, vph, int(offset),
+                snapshot_key = int(offset) if snapshot_tick is None else snapshot_tick
+                vehicles = pick_snapshot(self._snapshot_db, vph, snapshot_key,
                                          ego.traffic_random, lane, position, clearance)
                 ego.background.restore(libsumo, ego.prefix, vehicles)
         ego.episode += 1
@@ -345,7 +359,7 @@ class ParallelSumo:
         ego.present = True
         return ego._get_obs()
 
-    def reset(self, routes=None, *, replica_seeds=None, signal_ticks=None):
+    def reset(self, routes=None, *, replica_seeds=None, signal_ticks=None, snapshot_ticks=None):
         if routes is None and self.fixed_training_routes:
             routes = self.training_route_assignments(self.num_envs)
         valid_routes = set(self.routes) | ({None} if self.focus is not None else set())
@@ -356,9 +370,17 @@ class ParallelSumo:
                 or any(not isinstance(tick, (int, np.integer)) or
                        not 0 <= tick < self.signal_end_ticks[-1] for tick in signal_ticks)):
             raise ValueError("Expected one valid signal tick per replica")
+        if snapshot_ticks is not None and len(snapshot_ticks) != self.num_envs:
+            raise ValueError("Expected one snapshot key per replica")
         self._close_simulation()
         if not self.departures:
             self._find_departures()
+        if self.uniform_route_departures:
+            self.route_departure_options = tuple(
+                (route, departure)
+                for group in self.route_groups for route in group
+                for departure in self.departures[route]
+            )
         if self._snapshot_path is None:
             self._snapshot_bank = self._start_traffic_snapshots()
             if self._snapshot_bank is not None:
@@ -399,6 +421,12 @@ class ParallelSumo:
                 (_replica_id(index, a), _replica_id(index, b)): geometry
                 for (a, b), geometry in self.prototype._guidance_geometry.items()
             }
+            if ego.guidance_lateral_scale is not None:
+                dx, dy = self.network_offsets[index]
+                ego._guidance_geometry = {
+                    key: (length, sine, cosine, (x + dx, y + dy))
+                    for key, (length, sine, cosine, (x, y)) in ego._guidance_geometry.items()
+                }
             ego._ring_geometry = prefix_geometry(self.prototype._ring_geometry, ego.prefix)
             ego._signal_stop_lines = {
                 (_replica_id(index, tid), link): dict(line, lane_id=_replica_id(index, line["lane_id"]))
@@ -416,7 +444,8 @@ class ParallelSumo:
                 ego.focus_random = np.random.default_rng(seed.spawn(1)[0])
                 route, vph = self.focus.sample(ego.focus_random)
             tick = signal_ticks[index] if signal_ticks is not None else None
-            observations.append(self._respawn(ego, route, traffic_vph=vph, signal_tick=tick))
+            snapshot = {} if snapshot_ticks is None else {"snapshot_tick": snapshot_ticks[index]}
+            observations.append(self._respawn(ego, route, traffic_vph=vph, signal_tick=tick, **snapshot))
         return np.stack(observations)
 
     def _advance(self, egos, actions):

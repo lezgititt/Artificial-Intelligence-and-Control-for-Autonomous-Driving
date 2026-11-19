@@ -13,7 +13,8 @@ import traceback
 import numpy as np
 
 
-def _generate(config, directory, curriculum, reference_vph, levels, step, seed, refresh, ready, stop):
+def _generate(config, directory, curriculum, reference_vph, levels, step, seed, refresh, ready, stop,
+              capture_steps=None):
     # Import inside the spawned process: the caller may already own a libsumo instance.
     from env.parallel_sumo import _build_replicas, _replica_id, libsumo
     from env.parallel_traffic import TrafficSchedule
@@ -22,7 +23,7 @@ def _generate(config, directory, curriculum, reference_vph, levels, step, seed, 
     db = None
     try:
         directory = Path(directory)
-        snapshot_config, _, lights, ends, flows, _ = _build_replicas(
+        snapshot_config, _, lights, ends, flows, _, _ = _build_replicas(
             config, directory, len(levels), step, True, curriculum, reference_vph)
         libsumo.start(["sumo", "-c", snapshot_config, "--step-length", str(step),
                        "--seed", str(seed), "--collision.action", "remove",
@@ -39,6 +40,10 @@ def _generate(config, directory, curriculum, reference_vph, levels, step, seed, 
         db.execute("CREATE TABLE states (vph INTEGER, tick INTEGER, slot INTEGER, vehicles TEXT, "
                    "PRIMARY KEY (vph, tick, slot)) WITHOUT ROWID")
         warmup = int(np.ceil(curriculum.snapshot_warmup_seconds / step))
+        capture_steps = set(capture_steps) if capture_steps is not None else None
+        target_count = len(capture_steps) if capture_steps is not None else int(ends[-1])
+        if capture_steps is not None:
+            db.execute("CREATE TABLE signal_ticks (snapshot_tick INTEGER PRIMARY KEY, signal_tick INTEGER)")
         cycle = int(ends[-1])
         tt = _replica_id(0, lights[0])
         v = libsumo.vehicle
@@ -57,10 +62,15 @@ def _generate(config, directory, curriculum, reference_vph, levels, step, seed, 
                 schedule.ids.intersection_update(live)
             if step_index <= warmup:
                 continue
+            if capture_steps is not None and step_index not in capture_steps:
+                continue
             now = libsumo.simulation.getTime()
             phase = libsumo.trafficlight.getPhase(tt)
             remaining = round((libsumo.trafficlight.getNextSwitch(tt) - now) / step)
             tick = int(ends[phase] - remaining) % cycle
+            if capture_steps is not None:
+                db.execute("INSERT INTO signal_ticks VALUES (?, ?)", (step_index, tick))
+                tick = step_index
             for vph, schedule, prefix in zip(levels, schedules, prefixes, strict=True):
                 vehicles = []
                 for vid in sorted(schedule.ids & active):
@@ -73,7 +83,7 @@ def _generate(config, directory, curriculum, reference_vph, levels, step, seed, 
                                      lane, v.getLanePosition(vid), v.getSpeed(vid),
                                      v.getSpeedFactor(vid), v.getLength(vid)))
                 batch[vph, tick] = json.dumps(vehicles, separators=(",", ":"))
-            if len(batch) == len(levels) * cycle:
+            if len(batch) == len(levels) * target_count:
                 with db:
                     db.executemany("INSERT OR REPLACE INTO states VALUES (?, ?, ?, ?)",
                                    ((vph, tick, generation % 3, vehicles)
@@ -102,7 +112,12 @@ def _generate(config, directory, curriculum, reference_vph, levels, step, seed, 
 class TrafficSnapshotBank:
     """Own the generator process; readers in rollout workers only need its path."""
 
-    def __init__(self, config, curriculum, reference_vph, levels, step, seed, *, refresh):
+    def __init__(self, config, curriculum, reference_vph, levels, step, seed, *, refresh,
+                 capture_steps=None):
+        if capture_steps is not None:
+            capture_steps = tuple(set(capture_steps))
+            if refresh or not capture_steps or min(capture_steps) <= int(np.ceil(curriculum.snapshot_warmup_seconds / step)):
+                raise ValueError("Fixed capture steps must follow warm-up and cannot be refreshed")
         ctx = get_context("spawn")
         self.directory = TemporaryDirectory(prefix="sumo-traffic-states-")
         self.path = str(Path(self.directory.name) / "states.sqlite")
@@ -112,7 +127,7 @@ class TrafficSnapshotBank:
         self.process = ctx.Process(
             target=_generate,
             args=(config, self.directory.name, curriculum, reference_vph, levels, step, seed, refresh,
-                  child, self.stop), daemon=True)
+                  child, self.stop, capture_steps), daemon=True)
         try:
             self.process.start()
             child.close()

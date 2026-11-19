@@ -122,6 +122,7 @@ class SumoHighwayEnv(gym.Env):
         # ---- 차선변경 안전 게이트 설정 (mdp_config.ACTION["lane_change_safety"]) ----
         lcs = (action.get("lane_change_safety") or {})
         self.lc_safety_enabled = bool(lcs.get("enabled", True))
+        self.lc_spawn_protect_only = bool(lcs.get("spawn_protect_only", False))
         self.lc_front_min = float(lcs.get("min_front_gap", 5.0))   # m
         self.lc_rear_min = float(lcs.get("min_rear_gap", 5.0))     # m
         self.lc_front_tau = float(lcs.get("front_tau", 0.3))       # s
@@ -177,6 +178,12 @@ class SumoHighwayEnv(gym.Env):
         self.warmup_steps = int(mdp_sim["warmup_steps"])
         self.bc_observation = mdp_obs.get("layout") in ("bc43", "bc49")
         self.ring_observation_enabled = mdp_obs.get("layout") == "bc49"
+        self.guidance_lateral_scale = mdp_obs.get("guidance_lateral_scale")
+        if self.guidance_lateral_scale is not None:
+            self.guidance_lateral_scale = float(self.guidance_lateral_scale)
+            if (not self.ring_observation_enabled or not np.isfinite(self.guidance_lateral_scale)
+                    or self.guidance_lateral_scale <= 0):
+                raise ValueError("Guidance lateral distance requires bc49 and a positive finite scale")
         self.ring_distance_scale = float(mdp_obs.get("ring_distance_scale", 50.0))
         self.ring_visibility = float(mdp_obs.get("ring_visibility", 50.0))
         if self.ring_distance_scale <= 0 or self.ring_visibility <= 0:
@@ -224,7 +231,8 @@ class SumoHighwayEnv(gym.Env):
             net_file = config.find("input/net-file").get("value")
             net = ET.parse(os.path.join(os.path.dirname(cfg_path), net_file)).getroot()
             if self.bc_observation:
-                self._guidance_geometry = choice_geometry(net)
+                self._guidance_geometry = choice_geometry(
+                    net, include_entrances=self.guidance_lateral_scale is not None)
                 if self.ring_observation_enabled:
                     self._ring_geometry = ring_geometry(net, self.ring_visibility)
             lane_offsets = {}
@@ -305,6 +313,10 @@ class SumoHighwayEnv(gym.Env):
                 low = np.concatenate((low, [0, -1, 0, -1, 0, -1])).astype(np.float32)
                 high = np.concatenate((high, [1, np.inf, np.inf, np.inf, np.inf, np.inf])).astype(np.float32)
                 self.obs_dim = 49
+            if self.guidance_lateral_scale is not None:
+                low = np.concatenate((low, [-np.inf, -np.inf])).astype(np.float32)
+                high = np.concatenate((high, [np.inf, np.inf])).astype(np.float32)
+                self.obs_dim += 2
             self.observation_space = spaces.Box(low, high, dtype=np.float32)
 
 
@@ -1272,11 +1284,12 @@ class SumoHighwayEnv(gym.Env):
             signal = self._signal_observation(signals[0] if signals else None)
             navigation = navigation_observation(
                 self._api.vehicle, self.ego_id, self._guidance_geometry,
-                self.guidance_distance_scale)
+                self.guidance_distance_scale, self.guidance_lateral_scale)
             extra = (ring_observation(self._api, self.ego_id, self._ring_geometry, self.vmax,
                                       self.ring_distance_scale, self.ring_visibility)
                      if self.ring_observation_enabled else [])
-            return np.concatenate((base, np.asarray(signal + navigation + extra, dtype=np.float32)))
+            return np.concatenate((base, np.asarray(
+                signal + navigation[:8] + extra + navigation[8:], dtype=np.float32)))
 
         if self.signal_enabled:
             signals = self._upcoming_signals()
@@ -1415,6 +1428,11 @@ class SumoHighwayEnv(gym.Env):
             n_lanes = self._api.edge.getLaneNumber(edge)
             target = current + lane_change
             if target < 0 or target >= n_lanes:
+                return False
+            if (lane_change != 0 and not self.lc_safety_enabled and self.lc_spawn_protect_only
+                    and not lane_change_timing_allowed(
+                        edge, self._api.vehicle.getLanePosition(self.ego_id),
+                        self._api.vehicle.getRouteIndex(self.ego_id), self.lc_spawn_protect)):
                 return False
             # ★ 측면충돌 방지: 실제 이동 명령(0이 아닌 변경)에만 안전 검사
             if (lane_change != 0 and self.lc_safety_enabled

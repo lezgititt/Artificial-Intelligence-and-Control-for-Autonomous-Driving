@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from env import road_builder
+from env.background_demand import set_weighted_od_flow_rates
 from env.collision_detection import configure_collision_gaps
 from env.ego_routes import read_ego_route_groups
 from env.parallel_traffic import TrafficCurriculum
@@ -74,7 +75,7 @@ def plot_bc_training(fig, grid, run, evaluated_epoch=None):
         ax.grid(alpha=.25)
 
 
-def prepare_context(run, context, data_dir=None):
+def prepare_context(run, context, data_dir=None, *, max_vph=3000):
     """Restore collection conditions without relabelling BC as PPO training."""
     config = json.loads((run / 'config.json').read_text())
     if config.get('algorithm') != 'supervised_bc_on_ppo_hybrid_actor':
@@ -104,7 +105,7 @@ def prepare_context(run, context, data_dir=None):
         file.write('\nHPARAMS.update(' + repr(dict(hidden_sizes=tuple(config['hidden_sizes']),
                         activation=config['activation'], policy_type='hybrid')) + ')\n')
     reference = collection['traffic']['vehs_per_hour']
-    curriculum = TrafficCurriculum(max_vph=3000, total_vph=True, snapshot_warmup_seconds=250,
+    curriculum = TrafficCurriculum(max_vph=max_vph, total_vph=True, snapshot_warmup_seconds=250,
                                     ring_reference_vph=reference)
     from dataclasses import asdict
     saved = dict(evaluation_only=True, bc_spawn_protect_m=spawn_protect, training_algorithm=config['algorithm'],
@@ -115,16 +116,18 @@ def prepare_context(run, context, data_dir=None):
 
 
 def evaluate(run, out, num_workers, data_dir=None, checkpoint=None, ego_collision_gap_m=None,
-             background_collision_gap_m=None):
+             background_collision_gap_m=None, levels=LEVELS, *,
+             context_builder=None, training_plotter=None, policy_label='BC'):
     start = perf_counter()
-    saved, curriculum, data_dir = prepare_context(run, out / 'context', data_dir)
+    build_context = context_builder or prepare_context
+    saved, curriculum, data_dir = build_context(run, out / 'context', data_dir, max_vph=max(3000, *levels))
     model = out / 'context/model.pt'
     checkpoint = Path(checkpoint).resolve() if checkpoint else (run / 'model.pt').resolve()
     if checkpoint != (run / 'model.pt').resolve():
         shutil.copy2(checkpoint, model)
     evaluated_epoch = None
     result_path = run / 'result.json'
-    if result_path.exists():
+    if training_plotter is None and result_path.exists():
         training_result = json.loads(result_path.read_text())
         digest = hashlib.sha256(model.read_bytes()).hexdigest()
         for filename, epoch_key in [('last_model.pt','epochs_completed'),('model.pt','best_epoch')]:
@@ -135,7 +138,7 @@ def evaluate(run, out, num_workers, data_dir=None, checkpoint=None, ego_collisio
     details = out / 'details'
     details.mkdir()
     road, mdp, _ = load_saved_configs(str(model))
-    rows = {vph: [] for vph in LEVELS}
+    rows = {vph: [] for vph in levels}
     summaries = {}
     with TemporaryDirectory(prefix='sumo-quick-bc-') as directory:
         root = Path(directory)
@@ -147,7 +150,9 @@ def evaluate(run, out, num_workers, data_dir=None, checkpoint=None, ego_collisio
         saved['collision_detection'] = collision_settings
         (out / 'context/evaluation_config.json').write_text(json.dumps(saved, indent=2) + '\n')
         shutil.copy2(root / 'base/highway.rou.xml', out / 'context/evaluation_vehicle_types.rou.xml')
-        if road['TRAFFIC'].get('origin_lane_proportional'):
+        if road['TRAFFIC'].get('demand_profile') == 'weighted_od':
+            set_weighted_od_flow_rates(root/'base/highway.rou.xml', max(levels))
+        elif road['TRAFFIC'].get('origin_lane_proportional'):
             from collect_background_data import rebalance_origin_flows
             rebalance_origin_flows(root/'base', 3000)
         direct, ring = read_ego_route_groups(root / 'base/highway.ego.rou.xml')
@@ -155,7 +160,7 @@ def evaluate(run, out, num_workers, data_dir=None, checkpoint=None, ego_collisio
             raise ValueError('Expected 18 non-ring and 5 ring routes')
         routes = direct + ring
         bank = TrafficSnapshotBank(config, curriculum, road['TRAFFIC']['vehs_per_hour'],
-                                   tuple(v for v in LEVELS if v), STEP, 0, refresh=False)
+                                   tuple(v for v in levels if v), STEP, 0, refresh=False)
         try:
             chunks = np.array_split(TICKS, max(2, num_workers))
             with ProcessPoolExecutor(max_workers=num_workers, mp_context=get_context('spawn')) as pool:
@@ -163,7 +168,7 @@ def evaluate(run, out, num_workers, data_dir=None, checkpoint=None, ego_collisio
                     pool.submit(_evaluate_worker, model, config, root / f'vph_{level}_{i}', saved, level,
                                 [(j, route, int(tick)) for j, route in enumerate(routes) for tick in chunk],
                                 snapshot_path=bank.path): level
-                    for level in LEVELS for i, chunk in enumerate(chunks)
+                    for level in levels for i, chunk in enumerate(chunks)
                 }
                 for job in as_completed(jobs):
                     level = jobs[job]
@@ -176,14 +181,18 @@ def evaluate(run, out, num_workers, data_dir=None, checkpoint=None, ego_collisio
                               f'{len(rows[level])} arrivals', flush=True)
         finally:
             bank.close()
-    summary = dict(algorithm='supervised_bc_on_ppo_hybrid_actor', model_sha256=hashlib.sha256(model.read_bytes()).hexdigest(),
-                   source_run=str(run), source_checkpoint=str(checkpoint), evaluated_epoch=evaluated_epoch, source_dataset=str(data_dir), traffic_levels_vph=list(LEVELS),
+    summary = dict(algorithm=saved['training_algorithm'], model_sha256=hashlib.sha256(model.read_bytes()).hexdigest(),
+                   source_run=str(run), source_checkpoint=str(checkpoint), evaluated_epoch=evaluated_epoch,
+                   source_dataset=str(data_dir) if data_dir is not None else None, traffic_levels_vph=list(levels),
                    traffic_vph_definition='Total requested background demand, including ring traffic',
-                   randomize_departures=True, deterministic=True,
+                   traffic_demand_profile=road['TRAFFIC'].get('demand_profile', 'default'),
+                   randomize_departures=saved.get('randomize_departures', True), deterministic=True,
                    observation_neighbor_distance_mode=mdp['OBSERVATION'].get('neighbor_distance_mode', 'legacy'),
                    signal_offsets_s=[tick * STEP for tick in TICKS], episodes_per_level=len(routes) * len(TICKS),
                    elapsed_seconds=round(perf_counter() - start, 2), by_traffic_vph=summaries)
     summary['collision_detection'] = collision_settings
+    if 'ppo_training' in saved:
+        summary['ppo_training'] = saved['ppo_training']
     summary['red_wait_clearance_definition'] = dict(
         statistic='Last qualifying red-light stop in each episode; one sample per episode',
         ego_stop_speed_max_mps=0.5, leader_stop_speed_max_mps=0.5,
@@ -192,25 +201,31 @@ def evaluate(run, out, num_workers, data_dir=None, checkpoint=None, ego_collisio
     # Save numeric results before rendering so they survive plotting failures.
     (out / 'evaluation_summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     with (out / 'route_evaluation.csv').open('w', newline='') as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[LEVELS[0]][0]))
+        writer = csv.DictWriter(file, fieldnames=list(rows[levels[0]][0]))
         writer.writeheader()
-        writer.writerows(row for level in LEVELS for row in rows[level])
+        writer.writerows(row for level in levels for row in rows[level])
     with (out / 'red_wait_clearance_by_reference.csv').open('w', newline='') as file:
         fields=['traffic_vph','route','reference','n','min_m','q10_m','q1_m','median_m','q3_m','q90_m','max_m','mean_m']
         writer=csv.DictWriter(file,fieldnames=fields);writer.writeheader()
-        for level in LEVELS:
+        for level in levels:
             for route, stats in [('ALL',summaries[level]['all']), *summaries[level]['by_route'].items()]:
                 for reference, values in stats['red_wait_clearance_by_reference'].items():
                     writer.writerow(dict(traffic_vph=level,route=route,reference=reference,**values))
-    _plot_overview(run, out, routes, LEVELS, summaries, training_plotter=lambda fig, grid, r: plot_bc_training(fig, grid, r, evaluated_epoch=evaluated_epoch), policy_label='BC')
-    for level in LEVELS:
-        _plot_level(details, level, routes, rows[level], summaries[level], policy_label='BC')
+    if training_plotter is None:
+        def training_plotter(fig, grid, source):
+            plot_bc_training(fig, grid, source, evaluated_epoch=evaluated_epoch)
+    _plot_overview(run, out, routes, levels, summaries,
+                   training_plotter=training_plotter, policy_label=policy_label)
+    for level in levels:
+        _plot_level(details, level, routes, rows[level], summaries[level], policy_label=policy_label)
     print(f'Complete: {out}', flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('run', type=Path, help='BC actor result folder or an explicit .pt checkpoint (including selected_model.pt)')
+    parser.add_argument('--traffic-vph', type=int, nargs='+', default=LEVELS,
+                        help='Traffic levels to evaluate (default: 0 1000 2000 3000)')
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--out-dir', type=Path, help='New output directory; default: RUN/analysis/quick_bc')
     parser.add_argument('--data-dir', type=Path, help='Collection directory if the dataset was relocated')
@@ -231,13 +246,15 @@ def main():
         value = getattr(args, name)
         if value is not None and (not math.isfinite(value) or value < 0):
             parser.error(name.replace('_', '-') + ' must be finite and nonnegative')
+    if any(v < 0 for v in args.traffic_vph) or len(set(args.traffic_vph)) != len(args.traffic_vph):
+        parser.error('--traffic-vph requires distinct nonnegative values')
     out = (args.out_dir or run / 'analysis/quick_bc').resolve()
     if out.exists():
         parser.error('Output directory already exists; choose a new --out-dir')
     try:
         evaluate(run, out, args.num_workers, args.data_dir, checkpoint=checkpoint,
                  ego_collision_gap_m=args.ego_collision_gap_m,
-                 background_collision_gap_m=args.background_collision_gap_m)
+                 background_collision_gap_m=args.background_collision_gap_m, levels=args.traffic_vph)
     except (ValueError, FileNotFoundError) as exc:
         parser.error(str(exc))
 
