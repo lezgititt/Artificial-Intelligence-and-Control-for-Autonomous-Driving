@@ -33,7 +33,7 @@ from scripts.run_bc51_fixed_start import fixed_start_context
 from test import load_saved_configs
 from utils.evaluator import _DrivingStats, parallel_route_rows
 
-DEMAND = 6000
+DEMAND = 5000
 TRAFFIC_SEED = 21701
 MAX_REPLICAS_PER_WORKER = 64
 SNAPSHOT_TIMES = tuple(range(802, 951, 2))

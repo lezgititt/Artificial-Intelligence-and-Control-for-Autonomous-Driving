@@ -6,7 +6,7 @@ sumo-gui 화면으로 빠르게 확인하는 용도.
 
 사용법:
     python view_road.py             # 차선별 적응형 유입으로 sumo-gui 실행
-    python view_road.py --fixed-traffic  # 고정 6000대/시간 수요와 비교
+    python view_road.py --fixed-traffic  # 고정 5000대/시간 수요와 비교
     python view_road.py --netedit   # netedit(SUMO 도로 편집기)로 도로망 열기
     python view_road.py --nogui     # 화면 없이 설정 검증만 (GUI 없는 서버용)
 
@@ -17,7 +17,7 @@ sumo-gui 화면으로 빠르게 확인하는 용도.
 
 관찰 포인트:
     - 차선 수 / 도로 길이가 road_config.ROAD 대로인지  ← 재생 없이 바로 확인 가능
-    - (▶ 재생 후) 전체 교통량(--traffic-vph, 기본 6000)이 너무 한산하거나 막히지 않는지
+    - (▶ 재생 후) 전체 교통량(--traffic-vph, 기본 5000)이 너무 한산하거나 막히지 않는지
       → 정체가 심하면 학습 난이도가 급상승하니 여기서 미리 조정
     - 재생 속도는 상단 Delay(ms) 값으로 조절 (크게 잡을수록 느리게)
 
@@ -67,7 +67,7 @@ def configure_view_traffic(sumocfg, total_vph, adaptive=False):
     root = tree.getroot()
     routes = {r.get("id"): r.get("edges").split() for r in root.findall("route")}
     nodes = root.findall("flow")
-    profile = TrafficCurriculum(max_vph=6000, total_vph=True, ring_reference_vph=1500)
+    profile = TrafficCurriculum(max_vph=total_vph, total_vph=True, ring_reference_vph=1500)
     flows = parse_traffic_flows(nodes, routes, os.path.join(directory, "highway.net.xml"),
                                TRAFFIC["vehs_per_hour"], profile)
     for node in nodes:
@@ -203,8 +203,8 @@ if __name__ == "__main__":
     parser.add_argument("--seconds", type=int, default=120,
                         help="--nogui 검증 시 시뮬레이션 길이(초). 기본 120초. "
                              "(GUI 모드는 시간 제한 없이 사용자가 직접 제어)")
-    parser.add_argument("--traffic-vph", type=float, default=6000,
-                        help="전체 요청 교통량 상한(대/시간, 기본 6000)")
+    parser.add_argument("--traffic-vph", type=float, default=5000,
+                        help="전체 요청 교통량 상한(대/시간, 기본 5000)")
     parser.add_argument('--fixed-traffic', action='store_true', help='적응형 제어 없이 고정 수요로 비교')
     parser.add_argument('--queue-short', type=float, default=.3, help='짧은 대기열 기준 비율(기본 0.3)')
     parser.add_argument('--queue-long', type=float, default=.6, help='긴 대기열 기준 비율(기본 0.6)')
