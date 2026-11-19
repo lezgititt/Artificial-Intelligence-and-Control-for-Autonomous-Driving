@@ -1,4 +1,4 @@
-"""Prepare and evaluate a shared fixed-center, 23-route SUMO benchmark."""
+"""Prepare and evaluate a shared fixed-center, 24-route SUMO benchmark."""
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
@@ -48,6 +48,19 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
+def include_central_a1_a3(background_routes, ego_routes):
+    """Use the central route for the direct ID and keep the explicit ring variant."""
+    central = ET.parse(background_routes).find("./route[@id='r_A1_A3']")
+    if central is None:
+        raise ValueError("Missing central A1→A3 background route")
+    tree = ET.parse(ego_routes)
+    direct = tree.find("./route[@id='ego_d_A1_A3']")
+    if direct is None:
+        direct = ET.SubElement(tree.getroot(), "route", id="ego_d_A1_A3")
+    direct.set("edges", central.attrib["edges"])
+    tree.write(ego_routes, encoding="utf-8", xml_declaration=True)
+
+
 def prepare(suite, reference, traffic_vph):
     context = suite / "reference"
     if (reference / "evaluation_config.json").is_file():
@@ -58,14 +71,18 @@ def prepare(suite, reference, traffic_vph):
     curriculum = replace(curriculum, max_vph=traffic_vph, snapshot_warmup_seconds=800)
     road, _, _ = load_saved_configs(str(context / "model.pt"))
     config = road_builder.build(road["ROAD"], road["EGO"], road["TRAFFIC"], str(suite / "sumo"))
-    set_weighted_od_flow_rates(suite / "sumo/highway.rou.xml", traffic_vph)
+    background_routes = suite / "sumo/highway.rou.xml"
+    ego_routes = suite / "sumo/highway.ego.rou.xml"
+    set_weighted_od_flow_rates(background_routes, traffic_vph)
+    include_central_a1_a3(background_routes, ego_routes)
     gaps = configure_collision_gaps(config, ego_gap_m=road["EGO"]["collision_gap_m"],
                                     background_gap_m=road["TRAFFIC"]["collision_gap_m"])
-    routes = sum(read_ego_route_groups(suite / "sumo/highway.ego.rou.xml"), ())
-    if len(routes) != 23:
-        raise ValueError(f"Expected 23 routes, found {len(routes)}")
+    central, ring = read_ego_route_groups(ego_routes)
+    if (len(central), len(ring)) != (19, 5):
+        raise ValueError(f"Expected 19 central and 5 ring routes, found {len(central)} and {len(ring)}")
+    routes = central + ring
     entries = {r.get("id"): r.get("edges").split()[0]
-               for r in ET.parse(suite / "sumo/highway.ego.rou.xml").iter("route")}
+               for r in ET.parse(ego_routes).iter("route")}
     lane_counts = {e.get("id"): len(e.findall("lane"))
                    for e in ET.parse(suite / "sumo/highway.net.xml").iter("edge")}
     bank = TrafficSnapshotBank(config, curriculum, road["TRAFFIC"]["vehs_per_hour"],
