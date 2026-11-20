@@ -46,12 +46,8 @@ class AdaptiveTrafficSchedule(TrafficSchedule):
                                         for rate in self.controller.rates]
 
     def restore(self, api, prefix, vehicles):
-        first = self.serial
-        super().restore(api, prefix, vehicles)
-        self.controller.route_by_id.update(
-            (prefix(f"bg_{index}"), vehicle[0])
-            for index, vehicle in enumerate(vehicles, first)
-        )
+        restored = super().restore(api, prefix, vehicles)
+        self.controller.route_by_id.update(restored)
 
     def spawn_due(self, api, now, prefix, rng):
         if self.controller is None:

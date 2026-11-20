@@ -92,8 +92,27 @@ class TrafficSchedule:
         self.vph = 0
         self.serial = 0
 
+    _second_stage_lanes = None
+
+    @classmethod
+    def second_stage_internal_lanes(cls, api):
+        """Internal lanes that continue another internal lane (after a junction's waiting point)."""
+        if cls._second_stage_lanes is None:
+            # getLinks reports the junction lane used to reach the next lane in field 4 ("via").
+            cls._second_stage_lanes = frozenset(
+                link[4] for lane in api.lane.getIDList() if lane.startswith(":")
+                for link in api.lane.getLinks(lane) if link[4])
+        return cls._second_stage_lanes
+
     def restore(self, api, prefix, vehicles):
+        # A vehicle placed by moveTo on the second stage of a two-stage junction lane (left turn or
+        # U-turn past its waiting point) never moves again and blocks every crossing movement, which
+        # gridlocks the junction for the whole episode. Leave those few vehicles out of the restore.
+        skipped = self.second_stage_internal_lanes(api)
+        restored = {}
         for route, vehicle_type, lane, position, speed, speed_factor, _ in vehicles:
+            if lane.startswith(":") and prefix(lane) in skipped:
+                continue
             vehicle = prefix(f"bg_{self.serial}")
             self.serial += 1
             api.vehicle.add(vehicle, prefix(route), typeID=vehicle_type)
@@ -101,6 +120,8 @@ class TrafficSchedule:
             api.vehicle.setSpeedFactor(vehicle, speed_factor)
             api.vehicle.setPreviousSpeed(vehicle, speed)
             self.ids.add(vehicle)
+            restored[vehicle] = route
+        return restored
 
     def reset(self, api, now, vph, rng, live_ids):
         if self.ids:

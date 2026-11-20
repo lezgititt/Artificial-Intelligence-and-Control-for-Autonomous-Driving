@@ -172,7 +172,7 @@ def main():
     minibatches_per_epoch = rollout_steps // args.minibatch_size
 
     road_config.configure_parallel_training(args.phase)
-    curriculum = (TrafficCurriculum(max_vph=6000, total_vph=True, snapshot_warmup_seconds=250,
+    curriculum = (TrafficCurriculum(max_vph=5000, total_vph=True, snapshot_warmup_seconds=250,
                                     max_depart_delay_seconds=125, ring_reference_vph=1500)
                   if args.phase == 2 else None)
     signal_rewards = dict(SIGNAL_STOP_REWARDS)

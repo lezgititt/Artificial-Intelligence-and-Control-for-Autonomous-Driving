@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from algorithms.ppo import PPO
 from env import road_builder
 from env.adaptive_traffic_schedule import AdaptiveTrafficSchedule, adaptive_schedule_factory
-from env.background_demand import set_weighted_od_flow_rates
+from env.background_demand import CALIBRATED_VPH, set_weighted_od_flow_rates
 from env.collision_detection import configure_collision_gaps
 from env.control_timing import lane_change_timing_allowed
 from env.ego_routes import read_ego_route_groups
@@ -35,7 +35,7 @@ from scripts.run_bc51_fixed_start import fixed_start_context
 from test import load_saved_configs
 from utils.evaluator import _DrivingStats, parallel_route_rows
 
-DEMAND = 6000
+DEMAND = CALIBRATED_VPH
 TRAFFIC_SEED = 21701
 MAX_REPLICAS_PER_WORKER = 64
 SNAPSHOT_TIMES = tuple(range(802, 951, 2))
@@ -64,13 +64,27 @@ def include_central_a1_a3(background_routes, ego_routes):
     tree.write(ego_routes, encoding="utf-8", xml_declaration=True)
 
 
-def prepare(suite, reference, traffic_vph, adaptive=False, uniform_idm_vph=0):
+def use_current_road(context):
+    """Replace a copied reference's road snapshot with env/road_config.py, keeping its evaluation tail."""
+    saved = (context / "road_config.py").read_text(encoding="utf-8")
+    marker = "# BC evaluation context"
+    if marker not in saved:
+        raise ValueError("Reference road_config.py has no evaluation context block")
+    current = (Path(__file__).resolve().parents[1] / "env/road_config.py").read_text(encoding="utf-8")
+    (context / "road_config.py").write_text(
+        current.rstrip() + "\n\n" + marker + saved.split(marker, 1)[1], encoding="utf-8")
+
+
+def prepare(suite, reference, traffic_vph, adaptive=False, uniform_idm_vph=0, *,
+            traffic_seed=0, current_road=False):
     context = suite / "reference"
     if (reference / "evaluation_config.json").is_file():
         shutil.copytree(reference, context)
         curriculum = TrafficCurriculum(**read_json(context / "evaluation_config.json")["traffic_curriculum"])
     else:
         _, curriculum, _ = fixed_start_context(reference, context, max_vph=traffic_vph)
+    if current_road:
+        use_current_road(context)
     curriculum = replace(curriculum, max_vph=traffic_vph, snapshot_warmup_seconds=800)
     if adaptive:
         curriculum = replace(curriculum, total_vph=True, max_depart_delay_seconds=125)
@@ -95,7 +109,7 @@ def prepare(suite, reference, traffic_vph, adaptive=False, uniform_idm_vph=0):
     lane_counts = {e.get("id"): len(e.findall("lane"))
                    for e in ET.parse(suite / "sumo/highway.net.xml").iter("edge")}
     bank = TrafficSnapshotBank(config, curriculum, road["TRAFFIC"]["vehs_per_hour"],
-                               (traffic_vph,), STEP, 0, refresh=False,
+                               (traffic_vph,), STEP, traffic_seed, refresh=False,
                                capture_steps=[int(time / STEP) for time in SNAPSHOT_TIMES], adaptive=adaptive,
                                uniform_idm_vph=uniform_idm_vph)
     try:
@@ -116,13 +130,14 @@ def prepare(suite, reference, traffic_vph, adaptive=False, uniform_idm_vph=0):
                 for route in routes:
                     cases.append(dict(case_id=len(cases), worker=worker, snapshot_time_s=secs,
                                       snapshot_tick=snapshot_tick, tick=signal_ticks[snapshot_tick],
-                                      seed=0, traffic_seed=[TRAFFIC_SEED, secs, 0], route=route,
+                                      seed=0, traffic_seed=[TRAFFIC_SEED + traffic_seed, secs, 0], route=route,
                                       start_lane=lane_counts[entries[route]] // 2))
     if len({(c["snapshot_tick"], c["route"]) for c in cases}) != len(SNAPSHOT_TIMES) * len(routes):
         raise ValueError("Fixed case list must contain exactly one case per saved state and route")
     write_json(suite / "cases.json", cases)
     write_json(suite / "suite.json", dict(traffic_vph=traffic_vph, adaptive_traffic=adaptive,
-        uniform_idm_vph=uniform_idm_vph, warmup_seconds=800, routes=routes,
+        uniform_idm_vph=uniform_idm_vph, traffic_seed=traffic_seed, current_road=current_road,
+        warmup_seconds=800, routes=routes,
         settings=asdict(curriculum), vehicle_types=road["TRAFFIC"]["controllers"],
         collision_detection=gaps, simulation_step_seconds=STEP, max_seconds=500,
         max_replicas_per_worker=MAX_REPLICAS_PER_WORKER, workers=4, seeds_per_snapshot=1,
@@ -498,6 +513,10 @@ def main():
     init.add_argument("--traffic-vph", type=int, default=DEMAND)
     init.add_argument("--adaptive-traffic", action="store_true")
     init.add_argument("--uniform-idm-vph", type=int, default=0)
+    init.add_argument("--traffic-seed", type=int, default=0,
+                      help="Vary the warm-up traffic states and spawn streams (0 = original benchmark)")
+    init.add_argument("--current-road", action="store_true",
+                      help="Build the road from env/road_config.py instead of the reference's saved snapshot")
     evaluate = sub.add_parser("evaluate")
     evaluate.add_argument("suite", type=Path)
     evaluate.add_argument("label")
@@ -517,7 +536,7 @@ def main():
         if not 0 <= args.uniform_idm_vph < args.traffic_vph or (args.uniform_idm_vph and not args.adaptive_traffic):
             parser.error("--uniform-idm-vph requires adaptive traffic and must be below --traffic-vph")
         prepare(suite, args.reference.resolve(strict=True), args.traffic_vph, args.adaptive_traffic,
-                args.uniform_idm_vph)
+                args.uniform_idm_vph, traffic_seed=args.traffic_seed, current_road=args.current_road)
     else:
         if not 1 <= args.replicas <= MAX_REPLICAS_PER_WORKER or args.smoke < 0:
             parser.error(f"Expected 1–{MAX_REPLICAS_PER_WORKER} replicas and a nonnegative smoke-test count")

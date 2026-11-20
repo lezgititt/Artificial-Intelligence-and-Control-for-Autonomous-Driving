@@ -29,11 +29,11 @@ from env.road_builder import build
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--vph', type=int, default=6000)
+    parser.add_argument('--vph', type=int, default=5000)
     parser.add_argument('--seconds', type=int, default=3600)
     parser.add_argument('--warmup', type=int, default=250)
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--output', type=Path, default=Path('analysis/traffic_6000'))
+    parser.add_argument('--output', type=Path, default=Path('analysis/traffic_5000'))
     args = parser.parse_args()
     if args.vph <= 0 or args.seconds <= 0 or args.warmup < 0:
         parser.error('Demand and measurement duration must be positive; warmup must be nonnegative')
@@ -44,7 +44,7 @@ def main():
     directory = Path(config).parent
     root = ET.parse(directory / 'highway.rou.xml').getroot()
     routes = {r.get('id'): r.get('edges').split() for r in root.findall('route')}
-    curriculum = TrafficCurriculum(max_vph=6000, total_vph=True,
+    curriculum = TrafficCurriculum(max_vph=args.vph, total_vph=True,
                                   max_depart_delay_seconds=125, ring_reference_vph=1500)
     flows = parse_traffic_flows(root.findall('flow'), routes, directory / 'highway.net.xml',
                                road_config.TRAFFIC['vehs_per_hour'], curriculum)

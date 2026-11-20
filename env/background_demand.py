@@ -4,8 +4,31 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 
-def weighted_od_flows(root):
-    """Sample route variants with a reduced U-turn share and increased ring share."""
+# Demand split calibrated for the Nohyeong network: flow id -> veh/h at CALIBRATED_VPH total.
+# Found by scripts/tune_background_demand.py (background-only, Poisson arrivals, 5 seeds, 1 h each):
+# every flow finishes and waits at most about one signal cycle. Shares follow what each lane
+# group can discharge in its 20 s green; left-turn lanes shared with U-turns carry far less than
+# through lanes. See docs/traffic_calibration.md. Set to None to use the uniform formula below.
+CALIBRATED_VPH = 4740
+FLOW_SHARES = {
+    "f_A1_A1": 38.5, "f_A1_A2": 505.0, "f_A1_A3": 175.2, "f_A1_A4": 83.7, "f_A1_A5": 170.0,
+    "f_A2_A1": 467.2, "f_A2_A2": 38.5, "f_A2_A3": 97.7,
+    "f_A3_A1": 83.7, "f_A3_A2": 312.8, "f_A3_A3": 38.5, "f_A3_A4": 308.2, "f_A3_A5": 175.2,
+    "f_A4_A2": 118.2, "f_A4_A3": 264.8, "f_A4_A5": 143.9,
+    "f_A5_A1": 296.6, "f_A5_A3": 98.9, "f_A5_A5": 49.4,
+    "lf_RING_A1_A3": 253.9, "lf_RING_A2_A4": 233.6, "lf_RING_A3_A5": 276.0,
+    "lf_RING_A4_A1": 253.9, "lf_RING_A5_A2": 253.9,
+}
+
+
+def weighted_od_flows(root, shares=None):
+    """Sample route variants with a reduced U-turn share and increased ring share.
+
+    With ``shares`` (or module-level FLOW_SHARES) the split comes from that table instead,
+    so demand can follow each movement's lane capacity.
+    """
+    explicit = shares is not None
+    shares = shares if explicit else FLOW_SHARES
     routes = {route.get("id"): route.get("edges").split() for route in root.findall("route")}
     by_pair = {}
     for flow in root.findall("flow"):
@@ -38,22 +61,30 @@ def weighted_od_flows(root):
     released_share = previous_u_turn_share - probabilities[u_turn].sum()
     ring_share = probabilities[ring].sum()
     probabilities[ring] *= (ring_share + released_share) / ring_share
+    ids = [row[-1].get("id") for row in variants]
+    if shares is not None and not explicit and set(ids) != set(shares):
+        shares = None  # The calibrated table belongs to another flow set; keep the formula.
+    if shares is not None:
+        if set(ids) != set(shares) or min(shares.values()) <= 0:
+            raise ValueError(f"Demand shares must list every flow with a positive weight: {sorted(set(ids) ^ set(shares))}")
+        probabilities = np.array([float(shares[flow_id]) for flow_id in ids])
+        probabilities /= probabilities.sum()
     return variants, probabilities, len(by_pair), probabilities[u_turn].sum(), probabilities[ring].sum()
 
 
-def set_weighted_od_flow_rates(route_file, traffic_vph):
+def set_weighted_od_flow_rates(route_file, traffic_vph, shares=None):
     tree = ET.parse(route_file)
-    variants, probabilities, *_ = weighted_od_flows(tree.getroot())
+    variants, probabilities, *_ = weighted_od_flows(tree.getroot(), shares)
     for row, probability in zip(variants, probabilities, strict=True):
         row[-1].set("period", f"{3600 / (traffic_vph * probability):.12f}")
     tree.write(route_file, encoding="utf-8", xml_declaration=True)
 
 
-def sample_background_demand(route_file, traffic_vph, duration, seed, *, output=None):
+def sample_background_demand(route_file, traffic_vph, duration, seed, *, output=None, shares=None):
     """Generate independent route draws at a fixed total request rate."""
     tree = ET.parse(route_file)
     root = tree.getroot()
-    variants, probabilities, pairs, u_turn_share, ring_share = weighted_od_flows(root)
+    variants, probabilities, pairs, u_turn_share, ring_share = weighted_od_flows(root, shares)
     for flow in root.findall("flow"):
         root.remove(flow)
     rng = np.random.default_rng(seed)
