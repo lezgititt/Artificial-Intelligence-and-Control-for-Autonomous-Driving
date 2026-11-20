@@ -53,6 +53,16 @@ class StopClearanceTests(unittest.TestCase):
             result = self.env.get_stop_clearance()
         self.assertEqual(result, {"stop_clearance_m": None, "stop_reference": None})
 
+    def test_red_crossing_ignored_when_signal_turned_green_in_the_same_step(self):
+        light = Mock()
+        api = SimpleNamespace(trafficlight=light, TraCIException=RuntimeError)
+        with patch.object(SumoHighwayEnv, "_api", api):
+            light.getRedYellowGreenState.return_value = "rGr"
+            self.assertFalse(self.env._signal_still_red(("tls", 1, 0.1, "r")))  # 이번 스텝에 녹색 전환
+            self.assertTrue(self.env._signal_still_red(("tls", 0, 0.1, "r")))   # 계속 적색
+            light.getRedYellowGreenState.side_effect = RuntimeError("unknown tls")
+            self.assertTrue(self.env._signal_still_red(("tls", 0, 0.1, "r")))   # 조회 실패: 기존 판정 유지
+
     def test_evaluation_keeps_last_stop_after_driving_again(self):
         stats = _DrivingStats(1)
         stats.record(0, 0, False, {"stop_clearance_m": 12.0, "stop_reference": "stop_line"})

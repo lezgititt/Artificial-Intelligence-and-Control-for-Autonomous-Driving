@@ -950,6 +950,20 @@ class SumoHighwayEnv(gym.Env):
                 signals.append((tid, index, distance, state))
         return sorted(signals, key=lambda signal: signal[2])
 
+    def _signal_still_red(self, signal):
+        """스텝 전에 적색이던 신호가 이번 스텝에도 적색이었는지 확인한다.
+
+        signals_before 의 상태는 이동 '전' 값이다. SUMO는 스텝 시작에 신호를 먼저 바꾸고
+        차량을 움직이므로, 그 스텝에 녹색으로 바뀌어 정상 출발한 차량까지 적색 통과로
+        판정되던 오탐을 막는다 (docs/analysis/traffic_fixed_routes_6000_20261120.md).
+        신호를 다시 읽을 수 없으면 기존 판정을 유지한다.
+        """
+        try:
+            state = self._api.trafficlight.getRedYellowGreenState(signal[0])
+            return state[signal[1]].lower() == "r"
+        except (self._api.TraCIException, IndexError, AttributeError, TypeError):
+            return True
+
     def _next_signal(self):
         signals = self._upcoming_signals()
         return signals[0] if signals else None
@@ -1546,7 +1560,8 @@ class SumoHighwayEnv(gym.Env):
             traveled = self._api.vehicle.getDistance(self.ego_id) - distance_before
             for signal in signals_before:
                 crossed = traveled > signal[2] + 1e-6
-                red_light_violation |= crossed and signal[3].lower() == "r"
+                red_light_violation |= (crossed and signal[3].lower() == "r"
+                                        and self._signal_still_red(signal))
                 if (crossed and signal[3].lower() == "g"
                         and route_connected_before
                         and signal[0] not in self._rewarded_green_signals
