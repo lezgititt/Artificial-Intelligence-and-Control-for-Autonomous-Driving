@@ -4,8 +4,18 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 
-def weighted_od_flows(root):
-    """Sample route variants with a reduced U-turn share and increased ring share."""
+# Optional explicit demand split: flow id -> relative weight (any positive unit, e.g. veh/h).
+# None keeps the formula below. Every flow in the route file must be listed.
+FLOW_SHARES = None
+
+
+def weighted_od_flows(root, shares=None):
+    """Sample route variants with a reduced U-turn share and increased ring share.
+
+    With ``shares`` (or module-level FLOW_SHARES) the split comes from that table instead,
+    so demand can follow each movement's lane capacity.
+    """
+    shares = FLOW_SHARES if shares is None else shares
     routes = {route.get("id"): route.get("edges").split() for route in root.findall("route")}
     by_pair = {}
     for flow in root.findall("flow"):
@@ -38,22 +48,28 @@ def weighted_od_flows(root):
     released_share = previous_u_turn_share - probabilities[u_turn].sum()
     ring_share = probabilities[ring].sum()
     probabilities[ring] *= (ring_share + released_share) / ring_share
+    if shares is not None:
+        ids = [row[-1].get("id") for row in variants]
+        if set(ids) != set(shares) or min(shares.values()) <= 0:
+            raise ValueError(f"Demand shares must list every flow with a positive weight: {sorted(set(ids) ^ set(shares))}")
+        probabilities = np.array([float(shares[flow_id]) for flow_id in ids])
+        probabilities /= probabilities.sum()
     return variants, probabilities, len(by_pair), probabilities[u_turn].sum(), probabilities[ring].sum()
 
 
-def set_weighted_od_flow_rates(route_file, traffic_vph):
+def set_weighted_od_flow_rates(route_file, traffic_vph, shares=None):
     tree = ET.parse(route_file)
-    variants, probabilities, *_ = weighted_od_flows(tree.getroot())
+    variants, probabilities, *_ = weighted_od_flows(tree.getroot(), shares)
     for row, probability in zip(variants, probabilities, strict=True):
         row[-1].set("period", f"{3600 / (traffic_vph * probability):.12f}")
     tree.write(route_file, encoding="utf-8", xml_declaration=True)
 
 
-def sample_background_demand(route_file, traffic_vph, duration, seed, *, output=None):
+def sample_background_demand(route_file, traffic_vph, duration, seed, *, output=None, shares=None):
     """Generate independent route draws at a fixed total request rate."""
     tree = ET.parse(route_file)
     root = tree.getroot()
-    variants, probabilities, pairs, u_turn_share, ring_share = weighted_od_flows(root)
+    variants, probabilities, pairs, u_turn_share, ring_share = weighted_od_flows(root, shares)
     for flow in root.findall("flow"):
         root.remove(flow)
     rng = np.random.default_rng(seed)
