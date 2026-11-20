@@ -33,7 +33,7 @@ from scripts.run_bc51_fixed_start import fixed_start_context
 from test import load_saved_configs
 from utils.evaluator import _DrivingStats, parallel_route_rows
 
-DEMAND = 5000
+DEMAND = 4740  # env.background_demand.CALIBRATED_VPH
 TRAFFIC_SEED = 21701
 MAX_REPLICAS_PER_WORKER = 64
 SNAPSHOT_TIMES = tuple(range(802, 951, 2))
@@ -62,10 +62,23 @@ def include_central_a1_a3(background_routes, ego_routes):
     tree.write(ego_routes, encoding="utf-8", xml_declaration=True)
 
 
-def prepare(suite, reference, traffic_vph):
+def use_current_road(context):
+    """Replace a copied reference's road snapshot with env/road_config.py, keeping its evaluation tail."""
+    saved = (context / "road_config.py").read_text(encoding="utf-8")
+    marker = "# BC evaluation context"
+    if marker not in saved:
+        raise ValueError("Reference road_config.py has no evaluation context block")
+    current = (Path(__file__).resolve().parents[1] / "env/road_config.py").read_text(encoding="utf-8")
+    (context / "road_config.py").write_text(
+        current.rstrip() + "\n\n" + marker + saved.split(marker, 1)[1], encoding="utf-8")
+
+
+def prepare(suite, reference, traffic_vph, traffic_seed=0, current_road=False):
     context = suite / "reference"
     if (reference / "evaluation_config.json").is_file():
         shutil.copytree(reference, context)
+        if current_road:
+            use_current_road(context)
         curriculum = TrafficCurriculum(**read_json(context / "evaluation_config.json")["traffic_curriculum"])
     else:
         _, curriculum, _ = fixed_start_context(reference, context, max_vph=traffic_vph)
@@ -87,7 +100,7 @@ def prepare(suite, reference, traffic_vph):
     lane_counts = {e.get("id"): len(e.findall("lane"))
                    for e in ET.parse(suite / "sumo/highway.net.xml").iter("edge")}
     bank = TrafficSnapshotBank(config, curriculum, road["TRAFFIC"]["vehs_per_hour"],
-                               (traffic_vph,), STEP, 0, refresh=False,
+                               (traffic_vph,), STEP, traffic_seed, refresh=False,
                                capture_steps=[int(time / STEP) for time in SNAPSHOT_TIMES])
     try:
         destination = suite / "traffic_states.sqlite"
@@ -107,7 +120,7 @@ def prepare(suite, reference, traffic_vph):
                 for route in routes:
                     cases.append(dict(case_id=len(cases), worker=worker, snapshot_time_s=secs,
                                       snapshot_tick=snapshot_tick, tick=signal_ticks[snapshot_tick],
-                                      seed=0, traffic_seed=[TRAFFIC_SEED, secs, 0], route=route,
+                                      seed=0, traffic_seed=[TRAFFIC_SEED + traffic_seed, secs, 0], route=route,
                                       start_lane=lane_counts[entries[route]] // 2))
     if len({(c["snapshot_tick"], c["route"]) for c in cases}) != len(SNAPSHOT_TIMES) * len(routes):
         raise ValueError("Fixed case list must contain exactly one case per saved state and route")
@@ -452,6 +465,10 @@ def main():
     init.add_argument("suite", type=Path)
     init.add_argument("--reference", type=Path, required=True, help="Saved suite reference directory or BC results directory")
     init.add_argument("--traffic-vph", type=int, default=DEMAND)
+    init.add_argument("--traffic-seed", type=int, default=0,
+                      help="Vary the warm-up traffic states and spawn streams (0 = original benchmark)")
+    init.add_argument("--current-road", action="store_true",
+                      help="Build the road from env/road_config.py instead of the reference's saved snapshot")
     evaluate = sub.add_parser("evaluate")
     evaluate.add_argument("suite", type=Path)
     evaluate.add_argument("label")
@@ -468,7 +485,7 @@ def main():
     if args.command == "prepare":
         if args.traffic_vph < 1:
             parser.error("--traffic-vph must be positive")
-        prepare(suite, args.reference.resolve(strict=True), args.traffic_vph)
+        prepare(suite, args.reference.resolve(strict=True), args.traffic_vph, args.traffic_seed, args.current_road)
     else:
         if not 1 <= args.replicas <= MAX_REPLICAS_PER_WORKER or args.smoke < 0:
             parser.error(f"Expected 1–{MAX_REPLICAS_PER_WORKER} replicas and a nonnegative smoke-test count")

@@ -4,9 +4,21 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 
-# Optional explicit demand split: flow id -> relative weight (any positive unit, e.g. veh/h).
-# None keeps the formula below. Every flow in the route file must be listed.
-FLOW_SHARES = None
+# Demand split calibrated for the Nohyeong network: flow id -> veh/h at CALIBRATED_VPH total.
+# Found by scripts/tune_background_demand.py (background-only, Poisson arrivals, 5 seeds, 1 h each):
+# every flow finishes and waits at most about one signal cycle. Shares follow what each lane
+# group can discharge in its 20 s green; left-turn lanes shared with U-turns carry far less than
+# through lanes. See docs/traffic_calibration.md. Set to None to use the uniform formula below.
+CALIBRATED_VPH = 4740
+FLOW_SHARES = {
+    "f_A1_A1": 38.5, "f_A1_A2": 505.0, "f_A1_A3": 175.2, "f_A1_A4": 83.7, "f_A1_A5": 170.0,
+    "f_A2_A1": 467.2, "f_A2_A2": 38.5, "f_A2_A3": 97.7,
+    "f_A3_A1": 83.7, "f_A3_A2": 312.8, "f_A3_A3": 38.5, "f_A3_A4": 308.2, "f_A3_A5": 175.2,
+    "f_A4_A2": 118.2, "f_A4_A3": 264.8, "f_A4_A5": 143.9,
+    "f_A5_A1": 296.6, "f_A5_A3": 98.9, "f_A5_A5": 49.4,
+    "lf_RING_A1_A3": 253.9, "lf_RING_A2_A4": 233.6, "lf_RING_A3_A5": 276.0,
+    "lf_RING_A4_A1": 253.9, "lf_RING_A5_A2": 253.9,
+}
 
 
 def weighted_od_flows(root, shares=None):
@@ -15,7 +27,8 @@ def weighted_od_flows(root, shares=None):
     With ``shares`` (or module-level FLOW_SHARES) the split comes from that table instead,
     so demand can follow each movement's lane capacity.
     """
-    shares = FLOW_SHARES if shares is None else shares
+    explicit = shares is not None
+    shares = shares if explicit else FLOW_SHARES
     routes = {route.get("id"): route.get("edges").split() for route in root.findall("route")}
     by_pair = {}
     for flow in root.findall("flow"):
@@ -48,8 +61,10 @@ def weighted_od_flows(root, shares=None):
     released_share = previous_u_turn_share - probabilities[u_turn].sum()
     ring_share = probabilities[ring].sum()
     probabilities[ring] *= (ring_share + released_share) / ring_share
+    ids = [row[-1].get("id") for row in variants]
+    if shares is not None and not explicit and set(ids) != set(shares):
+        shares = None  # The calibrated table belongs to another flow set; keep the formula.
     if shares is not None:
-        ids = [row[-1].get("id") for row in variants]
         if set(ids) != set(shares) or min(shares.values()) <= 0:
             raise ValueError(f"Demand shares must list every flow with a positive weight: {sorted(set(ids) ^ set(shares))}")
         probabilities = np.array([float(shares[flow_id]) for flow_id in ids])
