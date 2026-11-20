@@ -36,6 +36,7 @@ import os
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 
@@ -48,6 +49,7 @@ from env.sumo_env import SumoHighwayEnv  # noqa: F401  (자동 감지 목적의 
 from sumolib import checkBinary
 from env.parallel_traffic import TrafficCurriculum, parse_traffic_flows
 from env.lane_inflow import LaneInflowController
+from env.uniform_idm import UniformIDM, separate_idm_type
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -59,12 +61,14 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 configure_parallel_training(phase=2)
 
 
-def configure_view_traffic(sumocfg, total_vph, adaptive=False):
+def configure_view_traffic(sumocfg, total_vph, adaptive=False, split_idm=False):
     """Use the Phase 2 route proportions and Poisson demand in standalone SUMO."""
     directory = os.path.dirname(sumocfg)
     route_path = os.path.join(directory, "highway.rou.xml")
     tree = ET.parse(route_path)
     root = tree.getroot()
+    if split_idm:
+        separate_idm_type(tree)
     routes = {r.get("id"): r.get("edges").split() for r in root.findall("route")}
     nodes = root.findall("flow")
     profile = TrafficCurriculum(max_vph=6000, total_vph=True, ring_reference_vph=1500)
@@ -96,9 +100,16 @@ def run_adaptive(sumocfg, flows, routes, args):
     import traci
     from traci.constants import VAR_LANE_ID, VAR_LANEPOSITION, VAR_SPEED, VAR_LENGTH
 
+    idm_share = TRAFFIC["controllers"]["idm"]["probability"] if args.uniform_idm else 0
+    adaptive_vph = args.traffic_vph * (1 - idm_share)
+    idm_vph = args.traffic_vph * idm_share
     controller = LaneInflowController(Path(sumocfg).with_name('highway.net.xml'), flows,
-                                      routes, args.traffic_vph, np.random.default_rng(args.seed),
+                                      routes, adaptive_vph, np.random.default_rng(args.seed),
                                       args.queue_short, args.queue_long)
+    idm = UniformIDM(flows, routes, controller.lanes, idm_vph,
+                     np.random.default_rng([args.seed, 1])) if args.uniform_idm else None
+    if idm is not None:
+        print(f"적응형 {adaptive_vph:g}대/시간 + IDM {idm_vph:g}대/시간 (24경로 균등)", flush=True)
     output = args.metrics_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     (output / 'queue_corridors.json').write_text(json.dumps({
@@ -134,9 +145,13 @@ def run_adaptive(sumocfg, flows, routes, args):
             while not args.nogui or traci.simulation.getTime() < args.seconds:
                 now = traci.simulation.getTime()
                 controller.spawn_due(traci, now, states)
+                if idm is not None:
+                    idm.spawn(traci, now, states, controller.route_by_id)
                 traci.simulationStep()
                 for vehicle in traci.simulation.getDepartedIDList():
                     traci.vehicle.subscribe(vehicle, (VAR_LANE_ID, VAR_LANEPOSITION, VAR_SPEED, VAR_LENGTH))
+                    if idm is not None and vehicle.startswith("uniform_idm_"):
+                        idm.entered[controller.route_by_id[vehicle]] += 1
                 subscriptions = traci.vehicle.getAllSubscriptionResults()
                 states = {v: (s[VAR_LANE_ID], s[VAR_LANEPOSITION], s[VAR_SPEED], s[VAR_LENGTH])
                           for v, s in subscriptions.items()}
@@ -152,8 +167,9 @@ def run_adaptive(sumocfg, flows, routes, args):
                 totals.update(time=traci.simulation.getTime(), active=len(states), pending=len(pending))
                 if controller.update_rates(totals['time']):
                     lane_writer.writerows(controller.rows(totals['time']))
-                    network_writer.writerow(totals | dict(requested_vph=sum(controller.rates),
-                                                         requested=controller.stats['requested'],
+                    network_writer.writerow(totals | dict(requested_vph=sum(controller.rates) + idm_vph,
+                                                         requested=controller.stats['requested'] + (
+                                                             sum(idm.requests.values()) if idm is not None else 0),
                                                          admissions_withheld=controller.stats['admissions_withheld']))
                     lane_file.flush()
                     network_file.flush()
@@ -170,6 +186,10 @@ def run_adaptive(sumocfg, flows, routes, args):
         summary = dict(totals, **controller.stats, max_requested_vph=args.traffic_vph,
                        queue_short=args.queue_short, queue_long=args.queue_long,
                        seed=args.seed, lanes=controller.rows(totals['time']))
+        if idm is not None:
+            summary["separate_uniform_idm"] = dict(
+                adaptive_vph=adaptive_vph, idm_vph=idm_vph,
+                requested=dict(idm.requests), entered=dict(idm.entered))
         (output / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
     print(f"측정 결과: 유입 {totals['entered']}대 / 배출 {totals['arrived']}대 / "
           f"도로 안 {totals['active']}대 / 진입 대기 {totals['pending']}대")
@@ -206,6 +226,7 @@ if __name__ == "__main__":
     parser.add_argument("--traffic-vph", type=float, default=6000,
                         help="전체 요청 교통량 상한(대/시간, 기본 6000)")
     parser.add_argument('--fixed-traffic', action='store_true', help='적응형 제어 없이 고정 수요로 비교')
+    parser.add_argument('--uniform-idm', action='store_true', help='IDM을 24개 경로에 별도 균등 투입')
     parser.add_argument('--queue-short', type=float, default=.3, help='짧은 대기열 기준 비율(기본 0.3)')
     parser.add_argument('--queue-long', type=float, default=.6, help='긴 대기열 기준 비율(기본 0.6)')
     parser.add_argument('--seed', type=int, default=0)
@@ -217,13 +238,18 @@ if __name__ == "__main__":
         parser.error('--queue-short < --queue-long < 0.9, 두 기준은 0 이상이어야 합니다.')
     if args.seconds <= 0:
         parser.error('--seconds는 0보다 커야 합니다.')
+    if args.uniform_idm and (args.fixed_traffic or args.netedit):
+        parser.error('--uniform-idm requires adaptive viewer mode')
 
     # 1) road_config 기준으로 SUMO 파일 (재)생성 — 수정사항이 즉시 반영된다
-    sumocfg = road_builder.build(ROAD, EGO, TRAFFIC, os.path.join(BASE, "env", "sumo"))
+    # The split-demand preview uses its own generated road files.
+    preview = TemporaryDirectory(prefix="sumo-uniform-idm-") if args.uniform_idm else None
+    sumocfg = road_builder.build(ROAD, EGO, TRAFFIC, preview.name if preview else os.path.join(BASE, "env", "sumo"))
     net_file = os.path.join(BASE, "env", "sumo", "highway.net.xml")
     print(f"도로 생성 완료: {sumocfg}")
     adaptive = not (args.fixed_traffic or args.netedit)
-    central_vph, right_vph, flows, routes = configure_view_traffic(sumocfg, args.traffic_vph, adaptive)
+    central_vph, right_vph, flows, routes = configure_view_traffic(
+        sumocfg, args.traffic_vph, adaptive, split_idm=args.uniform_idm)
     print_summary(args.traffic_vph, central_vph, right_vph, adaptive)
     if adaptive:
         print('  유입 제어: 차선별 녹색 평균 배출량 × 짧음 1.10 / 김 0.90, 포화 90% 이상 보류')

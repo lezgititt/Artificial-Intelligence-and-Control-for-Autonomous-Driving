@@ -48,7 +48,7 @@ class SignalExperimentTests(unittest.TestCase):
 
     def setUp(self):
         self.env = SumoHighwayEnv(self.cfg, ROAD, EGO, SIMULATION,
-                                  {**OBSERVATION, "lookahead_connectivity_enabled": False,
+                                  {**OBSERVATION, "layout": "legacy", "lookahead_connectivity_enabled": False,
                                    "signal_enabled": True, "signal_count": 1,
                                    "connectivity_half_width": 2, "destination_enabled": False},
                                   ACTION, {**REWARD, "red_light_penalty": 10.0,
@@ -105,6 +105,26 @@ class SignalExperimentTests(unittest.TestCase):
             self.place(2, color, speed=10)
             _, _, _, _, info = self.env.step([1, 0])
             self.assertFalse(info["red_light_violation"])
+
+    def test_stopline_crossing_uses_signal_applied_during_movement(self):
+        for before, after in (("r", "G"), ("G", "r")):
+            with self.subTest(before=before, after=after):
+                self.env.reset(seed=0)
+                self.place(2, before, speed=10)
+                tls_id, link_index, stop_distance, _ = self.env._next_signal()
+                distance_before = traci.vehicle.getDistance("ego")
+                count = len(traci.trafficlight.getRedYellowGreenState(tls_id))
+                traci.trafficlight.setProgramLogic(tls_id, traci.trafficlight.Logic(
+                    "transition_test", 0, 0,
+                    [traci.trafficlight.Phase(10, color * count) for color in (before, after)]))
+                traci.trafficlight.setProgram(tls_id, "transition_test")
+                traci.trafficlight.setPhaseDuration(tls_id, 0)
+                self.assertEqual(self.env._next_signal()[3], before)
+                _, _, terminated, _, info = self.env.step([1, 0])
+                self.assertGreater(traci.vehicle.getDistance("ego") - distance_before, stop_distance)
+                self.assertEqual(traci.trafficlight.getRedYellowGreenState(tls_id)[link_index], after)
+                self.assertEqual(info["red_light_violation"], after == "r")
+                self.assertEqual(terminated, after == "r")
 
     def test_green_stop_penalty_waits_and_resets_for_signals_and_leaders(self):
         self.env.rw.update(green_stop_penalty=0.02, green_stop_clear_gap=10.0)
@@ -358,7 +378,7 @@ class SignalExperimentTests(unittest.TestCase):
         reward = self.env.rw.copy()
         self.env.close()
         self.env = SumoHighwayEnv(self.cfg, ROAD, EGO, SIMULATION,
-                                  {**OBSERVATION, "lookahead_connectivity_enabled": False,
+                                  {**OBSERVATION, "layout": "legacy", "lookahead_connectivity_enabled": False,
                                    "signal_enabled": True, "signal_count": 2,
                                    "connectivity_half_width": 2, "destination_enabled": False},
                                   ACTION, reward, traffic=TRAFFIC)
@@ -476,13 +496,17 @@ class SignalExperimentTests(unittest.TestCase):
         np.testing.assert_array_equal(obs[36:41], [1, 0, 0, 0, 1])
         real_signal = self.env._next_signal()
         # Both stop lines crossed in one simulation step: red second signal must not be missed.
-        self.env._signal_stop_lines[("test_green", 0)] = {"lane_id": self.lane, "lane_position": 0.}
+        tls_id, red_index, _, _ = real_signal
+        state = list(traci.trafficlight.getRedYellowGreenState(tls_id))
+        green_index = (red_index + 1) % len(state)
+        state[green_index] = "G"
+        traci.trafficlight.setRedYellowGreenState(tls_id, "".join(state))
         original = self.env._upcoming_signals
         calls = [0]
         def upcoming():
             calls[0] += 1
             if calls[0] == 1:
-                return [("test_green", 0, .1, "G"), real_signal]
+                return [(tls_id, green_index, .1, "G"), real_signal]
             return original()
         with patch.object(self.env, "_upcoming_signals", side_effect=upcoming):
             _, reward, terminated, _, info = self.env.step([1, 0])

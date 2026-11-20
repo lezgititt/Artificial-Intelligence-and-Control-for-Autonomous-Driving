@@ -297,6 +297,7 @@ TRAFFIC = {
     "controllers": {
         "krauss": {   # 산만한 인간 운전자 — 제일 느리고 들쑥날쑥
             "probability": 0.35,
+            "lc_speed_gain": 0.0,
             "carFollowModel": "Krauss",
             "accel": 2.0, "decel": 4.5,
             "tau": 1.0, "min_gap": 2.5,
@@ -306,6 +307,7 @@ TRAFFIC = {
         },
         "idm": {      # 부드러운 표준 인간 모델 — 중간 속도
             "probability": 0.30,
+            "lc_speed_gain": 1.0,
             "carFollowModel": "IDM",
             "accel": 1.8, "decel": 3.5,
             "tau": 1.2, "min_gap": 2.0,
@@ -314,6 +316,7 @@ TRAFFIC = {
         },
         "eidm": {     # 반응지연 있는 현실적 인간 — 중간 속도
             "probability": 0.20,
+            "lc_speed_gain": 0.0,
             "carFollowModel": "EIDM",
             "accel": 2.0, "decel": 4.0,
             "tau": 1.1, "min_gap": 2.0,
@@ -322,6 +325,7 @@ TRAFFIC = {
         },
         "acc": {      # 크루즈 차량 — 배경차 중엔 가장 빠르고 일정함
             "probability": 0.15,
+            "lc_speed_gain": 0.0,
             "carFollowModel": "ACC",
             "accel": 2.0, "decel": 4.0,
             "tau": 1.5, "min_gap": 2.0,

@@ -25,6 +25,7 @@ from env import road_builder
 from env.road_config import ROAD, EGO, TRAFFIC, _CENTRAL_BACKGROUND_VPH, _RING_BACKGROUND_VPH
 from env.mdp_config import SIMULATION, OBSERVATION, ACTION, REWARD
 from env.control_timing import lane_change_timing_allowed
+from env.background_demand import sample_background_demand
 from env.collision_detection import configure_collision_gaps
 import libsumo
 
@@ -33,6 +34,10 @@ class BackgroundObserver(SumoHighwayEnv):
     @property
     def _api(self):
         return libsumo
+
+    def _ego_is_present(self):
+        active_ids = getattr(self, "_active_ids", None)
+        return super()._ego_is_present() if active_ids is None else self.ego_id in active_ids
 
 
 def rebalance_origin_flows(directory, total_vph):
@@ -127,9 +132,9 @@ def save_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
 
 
-def collect_episode(env, episode, seed, args, directory):
+def collect_episode(env, episode, seed, args, directory, extra_routes=None, traffic_schedule=None):
     lc_path = directory / f'lanechanges_{episode:03d}.xml'
-    command = ['sumo', '-c', env.cfg_path, '--step-length', str(env.step_length),
+    command = ['sumo', '-c', str(env.cfg_path), '--step-length', str(env.step_length),
                '--seed', str(seed), '--no-step-log', 'true', '--no-warnings', 'true',
                '--collision.action', 'remove', '--lanechange-output', str(lc_path),
                '--log', str(directory / f'sumo_{episode:03d}.log')]
@@ -138,11 +143,29 @@ def collect_episode(env, episode, seed, args, directory):
     route_paths = {}
     timing = time.monotonic()
     # Different warmup lengths also diversify the phase at the start of capture.
-    warmup = args.warmup_seconds + int(np.random.default_rng(seed).integers(0, 120))
+    warmup = (args.warmup_seconds + int(np.random.default_rng(seed).integers(0, 120))
+              if traffic_schedule is None else 0)
     warmup_ticks = round(warmup / env.step_length)
     duration_ticks = round(args.seconds / env.step_length)
+    sampled_routes = None
+    if getattr(args, "weighted_od", False):
+        base = Path(env.cfg_path).parent
+        sampled_routes = directory / f"demand_{episode:03d}.rou.xml"
+        sample_background_demand(base / "highway.rou.xml", args.traffic_vph,
+                                 warmup + args.seconds, seed, output=sampled_routes)
+        command += ["--route-files", f"{sampled_routes},{base / 'highway.ego.rou.xml'}"]
+    elif extra_routes is not None:
+        base = Path(env.cfg_path).parent
+        route_file = ET.parse(env.cfg_path).getroot().find("input/route-files").get("value")
+        command += ["--route-files", f"{base / route_file},{extra_routes}"]
+    expert_entries = Counter()
+    if traffic_schedule is not None:
+        command += ["--max-depart-delay", "125"]
     libsumo.start(command)
     try:
+        if traffic_schedule is not None:
+            rng = np.random.default_rng(seed)
+            traffic_schedule.reset(libsumo, 0., args.traffic_vph, rng, set())
         for tick in range(warmup_ticks + duration_ticks):
             collecting = tick >= warmup_ticks
             before = {}
@@ -155,8 +178,13 @@ def collect_episode(env, episode, seed, args, directory):
                         libsumo.vehicle.getRouteIndex(vid), protect)
                     libsumo.vehicle.setLaneChangeMode(vid, 1621 if allowed[vid] else 0)
             if collecting:
-                for vid in sorted(libsumo.vehicle.getIDList()):
-                    if libsumo.vehicle.getTypeID(vid) in getattr(args, "exclude_vehicle_type", ()):
+                collect_ids = libsumo.vehicle.getIDList()
+                env._active_ids = set(collect_ids)
+                included = getattr(args, "include_vehicle_type", None)
+                excluded = getattr(args, "exclude_vehicle_type", ())
+                for vid in sorted(collect_ids):
+                    vehicle_type = libsumo.vehicle.getTypeID(vid)
+                    if (included is not None and vehicle_type != included) or vehicle_type in excluded:
                         continue
                     obs = env.observe_vehicle(vid)
                     if obs.shape != (env.obs_dim,) or not np.isfinite(obs).all():
@@ -166,8 +194,16 @@ def collect_episode(env, episode, seed, args, directory):
                     before[vid] = (obs, libsumo.vehicle.getSpeed(vid),
                                    libsumo.vehicle.getRoadID(vid),
                                    libsumo.vehicle.getLaneIndex(vid), rid,
-                                   libsumo.vehicle.getTypeID(vid))
+                                   vehicle_type)
+            if traffic_schedule is not None:
+                traffic_schedule.spawn_due(libsumo, libsumo.simulation.getTime(), str, rng)
             libsumo.simulationStep()
+            if traffic_schedule is not None:
+                active = set(libsumo.vehicle.getIDList())
+                traffic_schedule.ids.intersection_update(active | set(libsumo.simulation.getPendingVehicles()))
+                for vid in libsumo.simulation.getDepartedIDList():
+                    if vid.startswith("uniform_idm_"):
+                        expert_entries[traffic_schedule.controller.route_by_id[vid]] += 1
             bad_vehicles.update(libsumo.simulation.getCollidingVehiclesIDList())
             bad_vehicles.update(libsumo.simulation.getStartingTeleportIDList())
             if not collecting:
@@ -196,7 +232,10 @@ def collect_episode(env, episode, seed, args, directory):
                 print(f'episode {episode}: {after_time-warmup:.0f}s, '
                       f'{len(rows):,} candidate pairs, {len(alive)} live vehicles', flush=True)
     finally:
+        env._active_ids = None
         libsumo.close()
+        if sampled_routes is not None:
+            sampled_routes.unlink()
     events = lane_change_events(lc_path, env.step_length)
     selected, actions, physical, vehicles, steps, times, rids, types = [], [], [], [], [], [], [], []
     speeds, next_speeds = [], []
@@ -261,6 +300,11 @@ def collect_episode(env, episode, seed, args, directory):
                   vehicle_types=dict(Counter(types)), bad_vehicle_ids=sorted(bad_vehicles),
                   wall_seconds=round(time.monotonic()-timing, 3))
     save_json(directory / f'episode_{episode:03d}.json', report)
+    if traffic_schedule is not None:
+        report.update(idm_entries_by_route=dict(expert_entries),
+                      idm_requests_by_route=dict(traffic_schedule.uniform_idm.requests),
+                      adaptive_requests=traffic_schedule.controller.stats["requested"])
+        save_json(directory / f'episode_{episode:03d}.json', report)
     print(f'episode {episode} complete: {len(selected):,} samples, '
           f'{counts["left_changes"] + counts["right_changes"]} lateral changes, '
           f'{report["wall_seconds"]:.1f}s wall time', flush=True)
@@ -318,6 +362,8 @@ def main():
                         help='Required valid left+right labels, excluding warmup/discarded data; 0 disables')
     parser.add_argument('--origin-lane-proportional', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--layout', choices=['bc43','bc49'], default='bc49')
+    parser.add_argument('--guidance-lateral-scale', type=float,
+                        help='Add two ego-relative entrance offsets in bc49, divided by this scale in meters')
     parser.add_argument('--sharded', action=argparse.BooleanOptionalAction, default=True,
                         help='Keep episode NPZ shards without a memory-heavy merged dataset')
     parser.add_argument('--min-free-gb', type=float, default=20.0)
@@ -327,6 +373,8 @@ def main():
                         help='Match ego timing: block native changes on internal edges and before this initial-edge distance')
     parser.add_argument('--exclude-vehicle-type', action='append', default=[],
                         help='Skip expert labels for this type while retaining it in traffic')
+    parser.add_argument('--weighted-od', action='store_true',
+                        help='Sample OD routes with 5% U-turns and 40.45% ring routes')
     parser.add_argument('--include-acc', action='store_true', help='Include ACC expert labels')
     parser.add_argument('--out-dir', type=Path)
     args = parser.parse_args()
@@ -345,12 +393,18 @@ def main():
         parser.error('Durations must be multiples of the simulation step length')
     directory = (args.out_dir or Path('data') / datetime.now().strftime('background_bc_%Y%m%d_%H%M%S')).resolve()
     directory.mkdir(parents=True, exist_ok=False)
-    cfg, traffic, measured_vph = build_collection_road(directory/'sumo', args.traffic_vph, args.origin_lane_proportional)
+    cfg, traffic, measured_vph = build_collection_road(
+        directory/'sumo', args.traffic_vph, args.origin_lane_proportional and not args.weighted_od)
+    if args.weighted_od:
+        traffic['demand_profile'] = 'weighted_od'
     collision_settings = configure_collision_gaps(cfg, ego_gap_m=EGO.get('collision_gap_m'),
                                                  background_gap_m=traffic.get('collision_gap_m'))
     observation = dict(OBSERVATION, layout=args.layout, ring_visibility=50.0, ring_distance_scale=50.0)
+    if args.guidance_lateral_scale is not None:
+        observation['guidance_lateral_scale'] = args.guidance_lateral_scale
     env = BackgroundObserver(cfg, ROAD, EGO, SIMULATION, observation, ACTION, REWARD, traffic=traffic)
-    if env.obs_dim != (49 if args.layout == 'bc49' else 43):
+    expected_dim = (49 if args.layout == 'bc49' else 43) + 2 * (args.guidance_lateral_scale is not None)
+    if env.obs_dim != expected_dim:
         raise ValueError(f'Unexpected observation size for {args.layout}: {env.obs_dim}')
     config = {**vars(args), 'out_dir': str(directory), 'observation': observation,
               'ego': EGO, 'traffic': traffic, 'simulation': SIMULATION,

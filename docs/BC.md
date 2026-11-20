@@ -71,7 +71,7 @@ python scripts/check_bc_shards.py "$data_dir"
 
 python scripts/train_bc_shards.py "$data_dir" --out-dir "$run_dir" \
   --epochs 100 --patience 100 --wall-seconds 21600 \
-  --batch-size 4096 --lr 0.0003 --seed 0 --device cuda
+  --batch-size 8192 --lr 0.00042 --seed 0 --device cuda
 
 python scripts/evaluate_quick_bc.py "$run_dir/model.pt" \
   --num-workers 4 --ego-collision-gap-m 0.2 --background-collision-gap-m 0.2 \

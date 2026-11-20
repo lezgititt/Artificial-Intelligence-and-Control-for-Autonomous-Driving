@@ -6,13 +6,15 @@ import math
 EMPTY = [0.0, -1.0, 0.0, -1.0, 0.0, -1.0]
 
 
-def ring_geometry(net, horizon=50.0):
+def ring_geometry(net, horizon=50.0, *, scope="legacy"):
     """Map each ring lane to its merge road and the other incoming lanes.
 
-    A merge point is the start of the shared outgoing external road. Include
-    internal approach lanes and upstream lanes, not just the final road edge.
+    The merge point is the start of the shared outgoing external road.
+    Direct scope observes only the straight mainline approach lane.
     Connectivity is used only for physical sensing, not route/lane advice.
     """
+    if scope not in ("legacy", "direct"):
+        raise ValueError(f"Unknown ring merge scope: {scope}")
     lanes = {l.get('id'): l for e in net.findall('edge') for l in e.findall('lane')}
     external = {e.get('id'): e for e in net.findall('edge') if e.get('function') != 'internal'}
     conns = net.findall('connection')
@@ -34,6 +36,17 @@ def ring_geometry(net, horizon=50.0):
             roads = {goal for goal, _ in goals}
             if len(roads) != 1:
                 raise ValueError(f'Ambiguous ring merge: {edge}')
+            goal = next(iter(roads))
+            if scope == "direct":
+                through = [c for c in conns if (c.get("to"), c.get("toLane")) in goals
+                           and c.get("from") in external and "RING_" not in c.get("from")
+                           and c.get("dir") == "s" and not c.get("tl")]
+                # A1's second ring lane can feed two outgoing lanes. Prefer the
+                # lane-preserving connection when choosing its mainline neighbor.
+                through.sort(key=lambda c: abs(int(c.get("toLane")) - int(lane.get("index"))))
+                mainline = (f'{through[0].get("from")}_{through[0].get("fromLane")}',) if through else ()
+                result[lane.get("id")] = dict(goal=goal, lanes=mainline)
+                continue
             approach = set()
             for c in conns:
                 if (c.get('to'), c.get('toLane')) not in goals or c.get('from') == edge:
@@ -61,7 +74,7 @@ def ring_geometry(net, horizon=50.0):
                     distance += float(lanes[current].get('length'))
                     if distance <= horizon:
                         pending.extend((parent, distance) for parent in parents[current])
-            result[lane.get('id')] = dict(goal=next(iter(roads)), lanes=tuple(sorted(approach)))
+            result[lane.get('id')] = dict(goal=goal, lanes=tuple(sorted(approach)))
     return result
 
 

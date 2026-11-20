@@ -51,8 +51,9 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('data_dir',type=Path);p.add_argument('--out-dir', type=Path, help='Default: results/BC_YYYYMMDD_HHMMSS')
     p.add_argument('--wall-seconds',type=float,default=21600);p.add_argument('--epochs',type=int,default=100)
-    p.add_argument('--batch-size',type=int,default=4096);p.add_argument('--lr',type=float,default=3e-4)
+    p.add_argument('--batch-size',type=int,default=8192);p.add_argument('--lr',type=float,default=4.2e-4)
     p.add_argument('--seed',type=int,default=0);p.add_argument('--device',default='cuda');p.add_argument('--patience',type=int,default=100)
+    p.add_argument('--hidden-sizes', nargs='+', type=int, default=HPARAMS['hidden_sizes'])
     a=p.parse_args();torch.set_num_threads(4);torch.manual_seed(a.seed);np.random.seed(a.seed)
     manifest=json.loads((a.data_dir/'manifest.json').read_text());collection=json.loads((a.data_dir/'config.json').read_text())
     paths=[a.data_dir/x for x in manifest['shards']];rng=np.random.default_rng(a.seed)
@@ -70,13 +71,13 @@ def main():
     mean=mean.astype(np.float32);std=std.astype(np.float32);w=np.sqrt(count/(3*counts));w=w/w.mean()
     a.out_dir = create_bc_result_dir(a.out_dir)
     device=torch.device(a.device);mt=torch.tensor(mean,device=device);st=torch.tensor(std,device=device);wt=torch.tensor(w,dtype=torch.float32,device=device)
-    model=HybridActorCritic(manifest['obs_dim'],hidden_sizes=HPARAMS['hidden_sizes'],activation=HPARAMS['activation'],init_log_std=HPARAMS['init_log_std'],lane_keep_bias=HPARAMS['lane_keep_bias']).to(device)
+    model=HybridActorCritic(manifest['obs_dim'],hidden_sizes=a.hidden_sizes,activation=HPARAMS['activation'],init_log_std=HPARAMS['init_log_std'],lane_keep_bias=HPARAMS['lane_keep_bias']).to(device)
     with torch.no_grad():model.v_head.weight.zero_();model.v_head.bias.zero_()
     for param in model.v_head.parameters():param.requires_grad_(False)
     model.log_std.requires_grad_(False)
     optimizer=torch.optim.Adam([x for x in model.parameters() if x.requires_grad],lr=a.lr)
     config=dict(data=str(a.data_dir/'manifest.json'),dataset_directory=str(a.data_dir.resolve()),init_model=None,
-                algorithm='supervised_bc_on_ppo_hybrid_actor',observation_dim=manifest['obs_dim'],hidden_sizes=HPARAMS['hidden_sizes'],activation=HPARAMS['activation'],seed=a.seed,
+                algorithm='supervised_bc_on_ppo_hybrid_actor',observation_dim=manifest['obs_dim'],hidden_sizes=a.hidden_sizes,activation=HPARAMS['activation'],seed=a.seed,
                 observation_neighbor_distance_mode=collection['observation'].get('neighbor_distance_mode','legacy'),
                 collision_detection=collection.get('collision_detection'),
                 epochs=a.epochs,wall_seconds=a.wall_seconds,batch_size=a.batch_size,lr=a.lr,train_samples=count,

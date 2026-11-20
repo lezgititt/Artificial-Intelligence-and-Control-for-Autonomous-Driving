@@ -14,7 +14,7 @@ import numpy as np
 
 
 def _generate(config, directory, curriculum, reference_vph, levels, step, seed, refresh, ready, stop,
-              capture_steps=None):
+              capture_steps=None, adaptive=False, uniform_idm_vph=0):
     # Import inside the spawned process: the caller may already own a libsumo instance.
     from env.parallel_sumo import _build_replicas, _replica_id, libsumo
     from env.parallel_traffic import TrafficSchedule
@@ -29,7 +29,12 @@ def _generate(config, directory, curriculum, reference_vph, levels, step, seed, 
                        "--seed", str(seed), "--collision.action", "remove",
                        "--no-warnings", "true", "--no-step-log", "true",
                        *curriculum.sumo_options()])
-        schedules = [TrafficSchedule(flows) for _ in levels]
+        if adaptive:
+            from env.adaptive_traffic_schedule import adaptive_schedule_factory
+            factory = adaptive_schedule_factory(config, directory, flows, lights, uniform_idm_vph)
+            schedules = [factory() for _ in levels]
+        else:
+            schedules = [TrafficSchedule(flows) for _ in levels]
         prefixes = [partial(_replica_id, i) for i in range(len(levels))]
         rngs = [np.random.default_rng(np.random.SeedSequence([seed, vph])) for vph in levels]
         for schedule, vph, rng in zip(schedules, levels, rngs, strict=True):
@@ -44,6 +49,8 @@ def _generate(config, directory, curriculum, reference_vph, levels, step, seed, 
         target_count = len(capture_steps) if capture_steps is not None else int(ends[-1])
         if capture_steps is not None:
             db.execute("CREATE TABLE signal_ticks (snapshot_tick INTEGER PRIMARY KEY, signal_tick INTEGER)")
+        if adaptive:
+            db.execute("CREATE TABLE adaptive_states (vph INTEGER, tick INTEGER, state TEXT, PRIMARY KEY (vph, tick))")
         cycle = int(ends[-1])
         tt = _replica_id(0, lights[0])
         v = libsumo.vehicle
@@ -82,6 +89,9 @@ def _generate(config, directory, curriculum, reference_vph, levels, step, seed, 
                     vehicles.append((v.getRouteID(vid).removeprefix(prefix("")), v.getTypeID(vid),
                                      lane, v.getLanePosition(vid), v.getSpeed(vid),
                                      v.getSpeedFactor(vid), v.getLength(vid)))
+                if adaptive:
+                    db.execute("INSERT INTO adaptive_states VALUES (?, ?, ?)",
+                               (vph, tick, json.dumps(schedule.checkpoint(now))))
                 batch[vph, tick] = json.dumps(vehicles, separators=(",", ":"))
             if len(batch) == len(levels) * target_count:
                 with db:
@@ -113,11 +123,13 @@ class TrafficSnapshotBank:
     """Own the generator process; readers in rollout workers only need its path."""
 
     def __init__(self, config, curriculum, reference_vph, levels, step, seed, *, refresh,
-                 capture_steps=None):
+                 capture_steps=None, adaptive=False, uniform_idm_vph=0):
         if capture_steps is not None:
             capture_steps = tuple(set(capture_steps))
             if refresh or not capture_steps or min(capture_steps) <= int(np.ceil(curriculum.snapshot_warmup_seconds / step)):
                 raise ValueError("Fixed capture steps must follow warm-up and cannot be refreshed")
+        if adaptive and capture_steps is None:
+            raise ValueError("Adaptive snapshots require fixed capture steps")
         ctx = get_context("spawn")
         self.directory = TemporaryDirectory(prefix="sumo-traffic-states-")
         self.path = str(Path(self.directory.name) / "states.sqlite")
@@ -127,7 +139,7 @@ class TrafficSnapshotBank:
         self.process = ctx.Process(
             target=_generate,
             args=(config, self.directory.name, curriculum, reference_vph, levels, step, seed, refresh,
-                  child, self.stop, capture_steps), daemon=True)
+                  child, self.stop, capture_steps, adaptive, uniform_idm_vph), daemon=True)
         try:
             self.process.start()
             child.close()

@@ -221,7 +221,7 @@ def _vtypes_block(traffic: dict):
                 attrs += ['lcStrategic="0"', 'lcCooperative="0"',
                           'lcSpeedGain="0"', 'lcKeepRight="0"']
             else:
-                attrs += [f'lcSpeedGain="{traffic.get("lc_speed_gain", 1.0)}"',
+                attrs += [f'lcSpeedGain="{c.get("lc_speed_gain", traffic.get("lc_speed_gain", 1.0))}"',
                           f'lcKeepRight="{traffic.get("lc_keep_right", 1.0)}"']
             vtype_lines.append("        <vType " + " ".join(attrs) + "/>")
         vtypes_block = ('    <vTypeDistribution id="carDist">\n'

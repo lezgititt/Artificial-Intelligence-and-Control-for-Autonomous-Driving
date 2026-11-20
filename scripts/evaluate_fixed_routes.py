@@ -19,6 +19,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from algorithms.ppo import PPO
 from env import road_builder
+from env.adaptive_traffic_schedule import AdaptiveTrafficSchedule, adaptive_schedule_factory
 from env.background_demand import set_weighted_od_flow_rates
 from env.collision_detection import configure_collision_gaps
 from env.control_timing import lane_change_timing_allowed
@@ -26,6 +27,7 @@ from env.ego_routes import read_ego_route_groups
 from env.parallel_sumo import ParallelSumo, libsumo
 from env.parallel_traffic import TrafficCurriculum, TrafficSchedule
 from env.traffic_snapshots import TrafficSnapshotBank
+from env.uniform_idm import separate_idm_type
 from scripts.evaluate import OUTCOMES, plt
 from scripts.evaluate_quick_bc import plot_bc_training
 from scripts.evaluate_quick_phase1 import STEP, summarize
@@ -62,7 +64,7 @@ def include_central_a1_a3(background_routes, ego_routes):
     tree.write(ego_routes, encoding="utf-8", xml_declaration=True)
 
 
-def prepare(suite, reference, traffic_vph):
+def prepare(suite, reference, traffic_vph, adaptive=False, uniform_idm_vph=0):
     context = suite / "reference"
     if (reference / "evaluation_config.json").is_file():
         shutil.copytree(reference, context)
@@ -70,11 +72,17 @@ def prepare(suite, reference, traffic_vph):
     else:
         _, curriculum, _ = fixed_start_context(reference, context, max_vph=traffic_vph)
     curriculum = replace(curriculum, max_vph=traffic_vph, snapshot_warmup_seconds=800)
+    if adaptive:
+        curriculum = replace(curriculum, total_vph=True, max_depart_delay_seconds=125)
     road, _, _ = load_saved_configs(str(context / "model.pt"))
     config = road_builder.build(road["ROAD"], road["EGO"], road["TRAFFIC"], str(suite / "sumo"))
     background_routes = suite / "sumo/highway.rou.xml"
     ego_routes = suite / "sumo/highway.ego.rou.xml"
     set_weighted_od_flow_rates(background_routes, traffic_vph)
+    if uniform_idm_vph:
+        tree = ET.parse(background_routes)
+        separate_idm_type(tree)
+        tree.write(background_routes, encoding="utf-8", xml_declaration=True)
     include_central_a1_a3(background_routes, ego_routes)
     gaps = configure_collision_gaps(config, ego_gap_m=road["EGO"]["collision_gap_m"],
                                     background_gap_m=road["TRAFFIC"]["collision_gap_m"])
@@ -88,7 +96,8 @@ def prepare(suite, reference, traffic_vph):
                    for e in ET.parse(suite / "sumo/highway.net.xml").iter("edge")}
     bank = TrafficSnapshotBank(config, curriculum, road["TRAFFIC"]["vehs_per_hour"],
                                (traffic_vph,), STEP, 0, refresh=False,
-                               capture_steps=[int(time / STEP) for time in SNAPSHOT_TIMES])
+                               capture_steps=[int(time / STEP) for time in SNAPSHOT_TIMES], adaptive=adaptive,
+                               uniform_idm_vph=uniform_idm_vph)
     try:
         destination = suite / "traffic_states.sqlite"
         with closing(sqlite3.connect(bank.path)) as source, closing(sqlite3.connect(destination)) as target:
@@ -112,7 +121,8 @@ def prepare(suite, reference, traffic_vph):
     if len({(c["snapshot_tick"], c["route"]) for c in cases}) != len(SNAPSHOT_TIMES) * len(routes):
         raise ValueError("Fixed case list must contain exactly one case per saved state and route")
     write_json(suite / "cases.json", cases)
-    write_json(suite / "suite.json", dict(traffic_vph=traffic_vph, warmup_seconds=800, routes=routes,
+    write_json(suite / "suite.json", dict(traffic_vph=traffic_vph, adaptive_traffic=adaptive,
+        uniform_idm_vph=uniform_idm_vph, warmup_seconds=800, routes=routes,
         settings=asdict(curriculum), vehicle_types=road["TRAFFIC"]["controllers"],
         collision_detection=gaps, simulation_step_seconds=STEP, max_seconds=500,
         max_replicas_per_worker=MAX_REPLICAS_PER_WORKER, workers=4, seeds_per_snapshot=1,
@@ -150,10 +160,18 @@ class FixedTrafficSchedule(TrafficSchedule):
 
 class FixedCaseSumo(ParallelSumo):
     def _respawn(self, ego, route=None, **kwargs):
-        if not isinstance(ego.background, FixedTrafficSchedule):
+        if self.adaptive_factory:
+            if not isinstance(ego.background, AdaptiveTrafficSchedule):
+                ego.background = self.adaptive_factory()
+        elif not isinstance(ego.background, FixedTrafficSchedule):
             ego.background = FixedTrafficSchedule(self.traffic_flows, self.prototype.traffic["controllers"],
                                                  self.origin_lanes)
         obs = super()._respawn(ego, route, **kwargs)
+        if self.adaptive_factory:
+            key = kwargs["snapshot_tick"]
+            state, = self._snapshot_db.execute("SELECT state FROM adaptive_states WHERE vph=? AND tick=?",
+                                               (ego.background.vph, key)).fetchone()
+            ego.background.restore_checkpoint(json.loads(state), libsumo.simulation.getTime())
         if self.expert_type:
             vehicle = libsumo.vehicle
             vehicle.setType(ego.ego_id, self.expert_type)
@@ -162,9 +180,23 @@ class FixedCaseSumo(ParallelSumo):
             return ego._get_obs()
         return obs
 
+    @staticmethod
+    def _record_adaptive_requests(ego, info):
+        schedule = ego.background
+        idm_requests = sum(schedule.uniform_idm.requests.values()) if schedule.uniform_idm else 0
+        info["background_requests"] = schedule.controller.stats["requested"] + idm_requests
+        info["uniform_idm_requests"] = idm_requests
+
     def _advance(self, egos, actions):
         if not self.expert_type:
-            yield from super()._advance(egos, actions)
+            for ego, transition in zip(egos, super()._advance(egos, actions), strict=True):
+                if self.adaptive_factory:
+                    ego.background.ids.intersection_update(self._live_background)
+                    self._record_adaptive_requests(ego, transition[4])
+                if ego.replica_index in getattr(self, "audit_before", {}):
+                    self.audit_after[ego.replica_index] = audit_state(
+                        ego, self.audit_before[ego.replica_index].get("signals", []))
+                yield transition
             return
 
         vehicle = libsumo.vehicle
@@ -192,6 +224,9 @@ class FixedCaseSumo(ParallelSumo):
                      if ego.present and vehicle.getRoadID(vid) == edge and not edge.startswith(":") else 0)
             state = (0., delta, delta, bool(delta), lane, speed, signals, connected, distance, None)
             transition = ego._finish_step(state, collided=vid in collided, arrived=vid in arrived)
+            if self.adaptive_factory:
+                ego.background.ids.intersection_update(self._live_background)
+                self._record_adaptive_requests(ego, transition[4])
             if ego.replica_index in getattr(self, 'audit_before', {}):
                 # Capture before step_evaluation removes a terminated vehicle.
                 self.audit_after[ego.replica_index] = audit_state(
@@ -259,6 +294,10 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
         traffic_curriculum=curriculum, fixed_traffic_vph=traffic_vph,
         traffic_snapshot_path=str(suite / "traffic_states.sqlite"))
     env.expert_type = expert_type
+    env.adaptive_factory = None
+    if spec.get("adaptive_traffic"):
+        env.adaptive_factory = adaptive_schedule_factory(
+            suite / "sumo/highway.sumocfg", scratch, env.traffic_flows, env.signal_ids, spec.get("uniform_idm_vph", 0))
     if env.prototype.step_length != STEP or env.prototype.max_steps * STEP != 500:
         raise ValueError("Fixed evaluation requires a 0.5-second step and a 500-second time limit")
     routes_xml = ET.parse(scratch / "parallel.rou.xml")
@@ -277,6 +316,7 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
     queue = iter(range(len(cases)))
     active = {slot: next(queue) for slot in range(env.num_envs)}
     completed = 0
+    adaptive_requests = {}
     trace_ids = set(trace_ids)
     trace_file = None
     try:
@@ -310,6 +350,9 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
                 if not (terminated or truncated):
                     obs[slot] = x
                     continue
+                if env.adaptive_factory:
+                    adaptive_requests[index] = {key: info[key] for key in
+                                                ("background_requests", "uniform_idm_requests")}
                 completed += 1
                 if completed % 250 == 0:
                     print(f"{scratch.name}: {completed}/{len(cases)}", flush=True)
@@ -326,7 +369,8 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
                 if ego.start_lane != case["start_lane"]:
                     raise RuntimeError("Refilled case used the wrong departure lane")
         rows = parallel_route_rows(records, env.prototype.visibility, env.prototype.step_length)
-        return [case | row for case, row in zip(cases, rows, strict=True)]
+        return [case | row | adaptive_requests.get(i, {})
+                for i, (case, row) in enumerate(zip(cases, rows, strict=True))]
     finally:
         if trace_file is not None:
             trace_file.close()
@@ -389,12 +433,12 @@ def plot_summary(out, label, rows, summary, routes, model_run):
     plt.close(fig)
 
 
-def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None):
+def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, *, output=None):
     started = perf_counter()
     reference = suite / "reference"
     spec = read_json(suite / "suite.json")
     cases = read_json(suite / "cases.json")
-    out = suite / label
+    out = output if output is not None else suite / label
     out.mkdir()
     context = out / "context"
     if model is not None:
@@ -452,6 +496,8 @@ def main():
     init.add_argument("suite", type=Path)
     init.add_argument("--reference", type=Path, required=True, help="Saved suite reference directory or BC results directory")
     init.add_argument("--traffic-vph", type=int, default=DEMAND)
+    init.add_argument("--adaptive-traffic", action="store_true")
+    init.add_argument("--uniform-idm-vph", type=int, default=0)
     evaluate = sub.add_parser("evaluate")
     evaluate.add_argument("suite", type=Path)
     evaluate.add_argument("label")
@@ -468,12 +514,13 @@ def main():
     if args.command == "prepare":
         if args.traffic_vph < 1:
             parser.error("--traffic-vph must be positive")
-        prepare(suite, args.reference.resolve(strict=True), args.traffic_vph)
+        if not 0 <= args.uniform_idm_vph < args.traffic_vph or (args.uniform_idm_vph and not args.adaptive_traffic):
+            parser.error("--uniform-idm-vph requires adaptive traffic and must be below --traffic-vph")
+        prepare(suite, args.reference.resolve(strict=True), args.traffic_vph, args.adaptive_traffic,
+                args.uniform_idm_vph)
     else:
         if not 1 <= args.replicas <= MAX_REPLICAS_PER_WORKER or args.smoke < 0:
             parser.error(f"Expected 1–{MAX_REPLICAS_PER_WORKER} replicas and a nonnegative smoke-test count")
-        if args.trace_failures_from is not None and args.expert is None:
-            parser.error('--trace-failures-from currently requires --expert')
         run(suite, args.label, args.expert, args.model.resolve(strict=True) if args.model else None,
             args.replicas, args.smoke,
             args.trace_failures_from.resolve(strict=True) if args.trace_failures_from else None)

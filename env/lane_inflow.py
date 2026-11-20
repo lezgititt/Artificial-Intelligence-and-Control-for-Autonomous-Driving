@@ -340,7 +340,7 @@ class LaneInflowController:
         self.next_due = [now + self._headway(rate) for rate in self.rates]
         return True
 
-    def spawn_due(self, api, now, states):
+    def spawn_due(self, api, now, states, *, prefix=str):
         pending = Counter(self.route_by_id.get(v) for v in api.simulation.getPendingVehicles())
         entries = defaultdict(list)
         for lane, pos, speed, length in states.values():
@@ -367,9 +367,9 @@ class LaneInflowController:
             if pending[flow.route] or blocked:
                 self.stats['admissions_withheld'] += 1
                 continue
-            vehicle = f'adaptive_{self.serial}'
+            vehicle = prefix(f'adaptive_{self.serial}')
             self.serial += 1
-            api.vehicle.add(vehicle, flow.route, typeID=flow.vehicle_type,
+            api.vehicle.add(vehicle, prefix(flow.route), typeID=flow.vehicle_type,
                             departLane=lane, departSpeed=flow.speed)
             self.route_by_id[vehicle] = flow.route
             self.stats['requested'] += 1

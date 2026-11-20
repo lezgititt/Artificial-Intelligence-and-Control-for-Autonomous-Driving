@@ -234,7 +234,8 @@ class SumoHighwayEnv(gym.Env):
                 self._guidance_geometry = choice_geometry(
                     net, include_entrances=self.guidance_lateral_scale is not None)
                 if self.ring_observation_enabled:
-                    self._ring_geometry = ring_geometry(net, self.ring_visibility)
+                    self._ring_geometry = ring_geometry(
+                        net, self.ring_visibility, scope=mdp_obs.get("ring_merge_scope", "legacy"))
             lane_offsets = {}
             for edge in net.findall("edge"):
                 offset = edge.find("stopOffset")
@@ -1523,7 +1524,7 @@ class SumoHighwayEnv(gym.Env):
                 early_lane_context = self._early_lane_change_context()
             lane_change_applied = self._apply_lane_change(lane_change)
 
-        # 신호 상태는 행동이 적용되는 스텝 시작 시점을 기준으로 판정한다.
+        # 이동 전에 통과 여부를 검사할 정지선과 제어 연결을 기록한다.
         signals_before = self._upcoming_signals()
         route_connected_before = (bool(signals_before)
                                   and self._lane_follows_route(self._api.vehicle.getLaneID(self.ego_id)))
@@ -1544,14 +1545,19 @@ class SumoHighwayEnv(gym.Env):
         traveled = 0.0
         if signals_before and alive:
             traveled = self._api.vehicle.getDistance(self.ego_id) - distance_before
-            for signal in signals_before:
-                crossed = traveled > signal[2] + 1e-6
-                red_light_violation |= crossed and signal[3].lower() == "r"
-                if (crossed and signal[3].lower() == "g"
+            for tls_id, link_index, stop_distance, _ in signals_before:
+                if traveled <= stop_distance + 1e-6:
+                    continue
+                # SUMO applies scheduled signal changes before moving vehicles.
+                # The crossed link may no longer appear in getNextTLS.
+                tls_state = self._api.trafficlight.getRedYellowGreenState(tls_id)
+                crossing_color = tls_state[link_index].lower()
+                red_light_violation |= crossing_color == "r"
+                if (crossing_color == "g"
                         and route_connected_before
-                        and signal[0] not in self._rewarded_green_signals
+                        and tls_id not in self._rewarded_green_signals
                         and self._lane_follows_route(self._api.vehicle.getLaneID(self.ego_id))):
-                    green_passed.add(signal[0])
+                    green_passed.add(tls_id)
         signals_after = self._upcoming_signals()
         signal_after = signals_after[0] if signals_after else None
         red_signal = self._nearest_red_signal(signals_after)
