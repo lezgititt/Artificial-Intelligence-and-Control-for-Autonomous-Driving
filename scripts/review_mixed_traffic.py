@@ -311,9 +311,16 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, capture=None, 
                     if vid in env._active_ids and 0 <= lead <= capture.get("before", 10.0) and (
                             lead <= 2.0 or abs(lead - round(lead)) < 1e-6):
                         x, y = api.vehicle.getPosition(vid)
+                        if capture.get("gray_others"):
+                            for v in env._active_ids:
+                                if v not in (vid, other):
+                                    api.vehicle.setColor(v, (150, 150, 150, 255))
                         api.vehicle.setColor(vid, (255, 0, 255, 255))
                         if other and other in env._active_ids:
                             api.vehicle.setColor(other, (0, 230, 0, 255))
+                        if capture.get("road_right"):
+                            # Rotate the view so the vehicle drives towards the right of the picture.
+                            api.gui.setAngle("View #0", capture.setdefault("angle", api.vehicle.getAngle(vid) - 90))
                         api.gui.setZoom("View #0", capture.get("zoom", 1400))
                         api.gui.setOffset("View #0", x, y)
                         api.gui.screenshot("View #0", str(Path(capture["out"]) / f"{label}_{vid}_t{now:07.1f}.png"))
@@ -429,6 +436,9 @@ def main():
                              "during the 10 s before TIME (every 1 s, then every step for the last 2 s); "
                              "the vehicle is painted magenta and OTHER green")
     parser.add_argument("--zoom", type=float, default=1400)
+    parser.add_argument("--gray-others", action="store_true", help="Paint every other vehicle gray in captures")
+    parser.add_argument("--road-right", action="store_true",
+                        help="Rotate captures so the vehicle drives to the right (angle fixed at the first frame)")
     parser.add_argument("--leader-gap-geometry", action="store_true",
                         help="Measure the front gap from lane geometry when SUMO clamps it at 0")
     parser.add_argument("--lane-prior", type=float, default=0.0,
@@ -446,7 +456,8 @@ def main():
         with TemporaryDirectory(prefix="sumo-review-") as work:
             cfg, flows, lanes = prepare_road(suite, Path(work), spec)
             run_road(cfg, flows, lanes, suite, model, vph, args.seconds, args.seeds[0],
-                     capture=dict(out=out, scenes=scenes, zoom=args.zoom))
+                     capture=dict(out=out, scenes=scenes, zoom=args.zoom, gray_others=args.gray_others,
+                                  road_right=args.road_right))
         print(f"Screenshots: {out}", flush=True)
         return
     out.mkdir(parents=True)
