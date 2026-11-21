@@ -30,6 +30,26 @@ class PhysicalNeighborTests(unittest.TestCase):
             self.vehicle.getLeader.return_value = ('', -1)
             self.assertIsNone(self.env._neighbor(0, True, physical=True))
 
+    def test_clamped_junction_leader_gap_uses_lane_geometry(self):
+        # SUMO reports 0 for a leader on the next junction lane once it is closer than minGap.
+        self.env.leader_gap_geometry = True
+        self.vehicle.getLeader.return_value = ('front', 0.0)
+        self.vehicle.getLaneID.side_effect = lambda vid: {'ego': 'A_1', 'front': ':n_0_0'}[vid]
+        self.vehicle.getLanePosition.side_effect = lambda vid: {'ego': 45.5, 'front': 1.8}[vid]
+        self.vehicle.getLength.return_value = 5.0
+        lane = Mock()
+        lane.getLinks.return_value = [('B_1', True, True, False, ':n_0_0', 'M', 's', 9.0)]
+        lane.getLength.return_value = 46.5
+        with patch('env.sumo_env.traci', SimpleNamespace(vehicle=self.vehicle, lane=lane)):
+            gap, _ = self.env._neighbor(0, True, physical=True)
+            self.assertEqual(gap, 0)                    # 1.0 m left on the lane + (1.8 - 5.0) = -2.2 m -> overlap
+            self.vehicle.getLanePosition.side_effect = lambda vid: {'ego': 45.5, 'front': 6.2}[vid]
+            gap, _ = self.env._neighbor(0, True, physical=True)
+            self.assertAlmostEqual(gap, 2.2)            # 1.0 + (6.2 - 5.0)
+            self.env.leader_gap_geometry = False
+            gap, _ = self.env._neighbor(0, True, physical=True)
+            self.assertAlmostEqual(gap, 2.5)            # previous behaviour: stuck at minGap
+
     def test_rear_gap_uses_followers_min_gap(self):
         self.vehicle.getFollower.return_value = ('rear', -1.7)
         with patch('env.sumo_env.traci', SimpleNamespace(vehicle=self.vehicle)):

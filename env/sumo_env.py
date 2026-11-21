@@ -202,6 +202,10 @@ class SumoHighwayEnv(gym.Env):
         self.neighbor_distance_mode = mdp_obs.get("neighbor_distance_mode", "legacy")
         if self.neighbor_distance_mode not in ("legacy", "bumper"):
             raise ValueError("neighbor_distance_mode must be legacy or bumper")
+        # SUMO reports a leader gap of 0, never negative, once a leader on the next (junction) lane is
+        # closer than minGap, so the bumper-mode front gap stays at minGap while the cars overlap.
+        # True measures that case from lane geometry instead. Default False keeps earlier runs unchanged.
+        self.leader_gap_geometry = bool(mdp_obs.get("leader_gap_geometry", False))
         # 밀도 정규화용 "차량 1대가 점유하는 길이" (차체 + 최소 간격)
         self.density_veh_len = float(mdp_obs.get("density_veh_length", 7.5))
         self.connectivity_half_width = 2 if self.bc_observation else int(mdp_obs.get("connectivity_half_width", 2))
@@ -576,10 +580,26 @@ class SumoHighwayEnv(gym.Env):
         if not vid:
             return None
         if physical and offset == 0:
+            clamped = leader and gap <= 0.05
             gap += self._api.vehicle.getMinGap(self.ego_id if leader else vid)
+            if clamped and getattr(self, "leader_gap_geometry", False):
+                geometric = self._geometric_leader_gap(vid)
+                if geometric is not None:
+                    gap = min(gap, geometric)
         if (gap < 0 and not physical) or gap > self.visibility:
             return None
         return float(max(gap, 0) if physical else gap), self._api.vehicle.getSpeed(vid)
+
+    def _geometric_leader_gap(self, leader):
+        """Bumper gap to a leader on the ego lane or on the lane it directly continues into."""
+        vehicle, lanes = self._api.vehicle, self._api.lane
+        own_lane, lead_lane = vehicle.getLaneID(self.ego_id), vehicle.getLaneID(leader)
+        lead_back = vehicle.getLanePosition(leader) - vehicle.getLength(leader)
+        if lead_lane == own_lane:
+            return lead_back - vehicle.getLanePosition(self.ego_id)
+        if any(lead_lane in (link[0], link[4]) for link in lanes.getLinks(own_lane)):
+            return lanes.getLength(own_lane) - vehicle.getLanePosition(self.ego_id) + lead_back
+        return None
 
     def _adjacent_junction_leader(self, offset):
         """Measure the bumper gap along an adjacent lane's internal continuation."""

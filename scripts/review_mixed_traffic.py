@@ -96,17 +96,27 @@ def snapshot(api, vid, now, action=None):
     leader = api.vehicle.getLeader(vid, 60.0)
     signals = api.vehicle.getNextTLS(vid)
     x, y = api.vehicle.getPosition(vid)
+    geometric = None
+    if leader and leader[0]:
+        # Bumper gap from lane geometry, independent of SUMO's reported leader gap.
+        own_lane, lead_lane = api.vehicle.getLaneID(vid), api.vehicle.getLaneID(leader[0])
+        lead_back = api.vehicle.getLanePosition(leader[0]) - api.vehicle.getLength(leader[0])
+        if lead_lane == own_lane:
+            geometric = lead_back - api.vehicle.getLanePosition(vid)
+        elif any(lead_lane in (link[0], link[4]) for link in api.lane.getLinks(own_lane)):
+            geometric = api.lane.getLength(own_lane) - api.vehicle.getLanePosition(vid) + lead_back
     return dict(t=now, lane=api.vehicle.getLaneID(vid), pos=round(api.vehicle.getLanePosition(vid), 1),
                 x=round(x, 1), y=round(y, 1), speed=round(api.vehicle.getSpeed(vid), 2),
                 accel_cmd=None if action is None else round(float(action[0]), 2),
                 lane_cmd=None if action is None else int(round(float(action[1]))),
                 leader=None if not leader or not leader[0] else dict(
+                    geometric_gap=None if geometric is None else round(geometric, 2),
                     id=leader[0], type=api.vehicle.getTypeID(leader[0]), gap=round(leader[1], 1),
                     speed=round(api.vehicle.getSpeed(leader[0]), 2)),
                 signal=None if not signals else dict(state=signals[0][3], distance=round(signals[0][2], 1)))
 
 
-def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, capture=None):
+def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, capture=None, options=None):
     import torch
     from collect_background_data import libsumo as api
     if capture:
@@ -129,6 +139,14 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, capture=None):
 
     env = Observer(str(cfg), road["ROAD"], road["EGO"], mdp["SIMULATION"], mdp["OBSERVATION"],
                              mdp["ACTION"], train["REWARD"], traffic=road["TRAFFIC"])
+    options = options or {}
+    env.leader_gap_geometry = bool(options.get("leader_gap_geometry"))
+    lane_shift = None
+    if options.get("lane_prior"):
+        # Training weighted the lane classes (sqrt inverse frequency), which moves the decision
+        # boundary towards "change". Subtracting scale*log(weight) undoes that at inference.
+        weights = read_json(model.parent / "config.json")["lane_weights"]
+        lane_shift = torch.tensor(np.log(weights) * float(options["lane_prior"]), dtype=torch.float32)
     env.lc_safety_enabled = False
     env.lc_spawn_protect_only = True
     env.lc_spawn_protect = 30.0
@@ -172,12 +190,20 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, capture=None):
             if active:
                 with torch.inference_mode():
                     obs = np.stack([env.observe_vehicle(vid) for vid in active])
-                    actions = actor.det_action(torch.from_numpy(obs)).numpy()
-                for vid, action in zip(active, actions, strict=True):
+                    if lane_shift is None:
+                        actions = actor.det_action(torch.from_numpy(obs)).numpy()
+                    else:
+                        mu, _, logits, _ = actor.forward(torch.from_numpy(obs))
+                        lane = torch.as_tensor(actor.LANE_CMDS)[torch.argmax(logits - lane_shift, dim=-1)]
+                        actions = torch.cat([mu, lane.unsqueeze(-1)], dim=-1).numpy()
+                for vid, action, row in zip(active, actions, obs, strict=True):
                     env.ego_id = vid
                     before[vid] = env._prepare_step(action)
                     commands[vid] = action
-                    history[vid].append(snapshot(api, vid, now, action))
+                    record = snapshot(api, vid, now, action)
+                    # What the policy saw: own speed and the 5-lane neighbour block (left2..right2).
+                    record["obs_neighbors"] = [round(float(x), 3) for x in row[:21]]
+                    history[vid].append(record)
 
             # Last known state of every vehicle, needed after SUMO removes collided ones.
             previous = {vid: (api.vehicle.getTypeID(vid), api.vehicle.getLaneID(vid),
@@ -292,6 +318,11 @@ def main():
                         help="Replay the first seed in SUMO GUI and save screenshots following each vehicle "
                              "during the 10 s before TIME (every 1 s, then every step for the last 2 s)")
     parser.add_argument("--zoom", type=float, default=1400)
+    parser.add_argument("--leader-gap-geometry", action="store_true",
+                        help="Measure the front gap from lane geometry when SUMO clamps it at 0")
+    parser.add_argument("--lane-prior", type=float, default=0.0,
+                        help="Subtract this multiple of log(training lane class weight) from the lane logits "
+                             "(1.0 removes the class weighting; 0 keeps the trained decision)")
     args = parser.parse_args()
     suite, model = args.suite.resolve(strict=True), args.model.resolve(strict=True)
     spec = read_json(suite / "suite.json")
@@ -310,7 +341,8 @@ def main():
     cfg, flows, lanes = prepare_road(suite, out, spec)
     rows, events = [], []
     with ProcessPoolExecutor(min(args.workers, len(args.seeds)), mp_context=get_context("spawn")) as pool:
-        for job in [pool.submit(run_road, cfg, flows, lanes, suite, model, vph, args.seconds, seed)
+        options = dict(leader_gap_geometry=args.leader_gap_geometry, lane_prior=args.lane_prior)
+        for job in [pool.submit(run_road, cfg, flows, lanes, suite, model, vph, args.seconds, seed, None, options)
                     for seed in args.seeds]:
             r, e = job.result()
             rows.extend(r)
