@@ -92,6 +92,77 @@ class Trip:
                     green_stop_s=self.green_stop * step, tailgate_s=self.tailgate * step)
 
 
+class Interactions:
+    """Detect overtakes and responses to vehicles cutting in, for every vehicle on the road.
+
+    overtake: a vehicle changes lane while its leader (within 40 m) is slower, and within 30 s
+              it is ahead of that former leader on the same road.
+    cut-in:   another vehicle changes into the lane right in front (gap < 15 m) while this one
+              drives faster than 3 m/s; the next 10 s show how it reacted.
+    """
+    def __init__(self, kinds):
+        self.kinds = kinds          # vehicle id -> kind ("bc", "idm", ...)
+        self.state = {}             # vehicle id -> (edge, lane index, lane id, leader id, gap, leader speed, speed)
+        self.overtakes, self.cutins, self.rows = [], [], []
+
+    def step(self, api, now, live, previous, collided, seed):
+        for vid in live:
+            if vid not in self.kinds:
+                continue
+            edge, index, lane = api.vehicle.getRoadID(vid), api.vehicle.getLaneIndex(vid), api.vehicle.getLaneID(vid)
+            speed = api.vehicle.getSpeed(vid)
+            found = api.vehicle.getLeader(vid, 60.0)
+            leader, gap = (found[0], found[1]) if found and found[0] else (None, None)
+            lead_speed = api.vehicle.getSpeed(leader) if leader else None
+            old = self.state.get(vid)
+            if old and not edge.startswith(":") and edge == old[0] and index != old[1]:
+                o_leader, o_gap, o_speed = old[3], old[4], old[5]
+                if o_leader and o_gap is not None and o_gap < 40 and o_speed is not None and o_speed < old[6] - 0.5:
+                    self.overtakes.append(dict(vid=vid, other=o_leader, t=now, until=now + 30, own=old[6], other_speed=o_speed))
+            elif (old and leader and leader != old[3] and gap is not None and gap < 15 and speed >= 3
+                  and leader in previous and previous[leader][1] != lane
+                  and previous[leader][1].rsplit("_", 1)[0] == edge and not edge.startswith(":")):
+                self.cutins.append(dict(vid=vid, other=leader, t=now, until=now + 10, gap0=gap, v0=speed,
+                                        min_gap=gap, min_speed=speed))
+            self.state[vid] = (edge, index, lane, leader, gap, lead_speed, speed)
+        for item in list(self.overtakes):
+            vid, other = item["vid"], item["other"]
+            result = None
+            if vid in collided:
+                result = "collision"
+            elif vid not in live or other not in live:
+                result = "unresolved"
+            elif (api.vehicle.getRoadID(vid) == api.vehicle.getRoadID(other)
+                  and api.vehicle.getLanePosition(vid) - api.vehicle.getLength(vid) > api.vehicle.getLanePosition(other)):
+                result = "passed"
+            elif now >= item["until"]:
+                result = "not_passed"
+            if result:
+                self.overtakes.remove(item)
+                self._row(seed, "overtake", item, result, now)
+        for item in list(self.cutins):
+            vid, other = item["vid"], item["other"]
+            if vid in live:
+                item["min_speed"] = min(item["min_speed"], api.vehicle.getSpeed(vid))
+                found = api.vehicle.getLeader(vid, 60.0)
+                if found and found[0] == other:
+                    item["min_gap"] = min(item["min_gap"], found[1])
+            result = "collision" if vid in collided else ("unresolved" if vid not in live else (
+                "handled" if now >= item["until"] else None))
+            if result:
+                self.cutins.remove(item)
+                self._row(seed, "cut_in_ahead", item, result, now)
+
+    def _row(self, seed, kind, item, result, now):
+        self.rows.append(dict(seed=seed, event=kind, vehicle=item["vid"], kind=self.kinds.get(item["vid"]),
+                              other=item["other"], other_kind=self.kinds.get(item["other"], "?"), t=item["t"],
+                              result=result, resolved_s=round(now - item["t"], 1),
+                              own_speed=round(item.get("own", item.get("v0", 0)), 2),
+                              other_speed=round(item.get("other_speed", 0), 2),
+                              gap0=round(item.get("gap0", -1), 2), min_gap=round(item.get("min_gap", -1), 2),
+                              speed_drop=round(item.get("v0", 0) - item.get("min_speed", 0), 2)))
+
+
 def snapshot(api, vid, now, action=None):
     leader = api.vehicle.getLeader(vid, 60.0)
     signals = api.vehicle.getNextTLS(vid)
@@ -166,6 +237,8 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, capture=None, 
     step = env.step_length
     pending, active = {}, {}
     trips, history, rows, events = {}, {}, [], []
+    kinds = {}
+    interactions = Interactions(kinds)
     command = ["sumo-gui" if capture else "sumo", "-c", str(cfg), "--step-length", str(step), "--seed", str(seed),
                "--no-step-log", "true", "--no-warnings", "true", "--collision.action", "remove",
                "--max-depart-delay", str(MAX_DEPART_DELAY)]
@@ -210,12 +283,14 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, capture=None, 
                               api.vehicle.getSpeed(vid), api.vehicle.getDistance(vid), api.vehicle.getRouteID(vid))
                         for vid in env._active_ids}
             if capture:
-                for vid, when, label in scenes:
+                for vid, when, label, other in scenes:
                     lead = when - now
                     if vid in env._active_ids and 0 <= lead <= capture.get("before", 10.0) and (
                             lead <= 2.0 or abs(lead - round(lead)) < 1e-6):
                         x, y = api.vehicle.getPosition(vid)
                         api.vehicle.setColor(vid, (255, 0, 255, 255))
+                        if other and other in env._active_ids:
+                            api.vehicle.setColor(other, (0, 230, 0, 255))
                         api.gui.setZoom("View #0", capture.get("zoom", 1400))
                         api.gui.setOffset("View #0", x, y)
                         api.gui.screenshot("View #0", str(Path(capture["out"]) / f"{label}_{vid}_t{now:07.1f}.png"))
@@ -240,10 +315,12 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, capture=None, 
                     kind = api.vehicle.getTypeID(vid)
                     trips[vid] = Trip("bc" if kind == EGO_TYPE else kind.removeprefix("car_"),
                                       api.vehicle.getRouteID(vid), now, api.vehicle.getDistance(vid))
+                    kinds[vid] = trips[vid].kind
             if not capture:
                 for vid in live:
                     if vid in trips:
                         trips[vid].update(api, vid, now, step)
+                interactions.step(api, now, live, previous, collided, seed)
 
             def close(vid, status):
                 trip = trips.pop(vid, None)
@@ -302,7 +379,7 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, capture=None, 
     finally:
         api.close()
     print(f"Seed {seed}: BC {dict(Counter(r['status'] for r in rows if r['kind'] == 'bc'))}", flush=True)
-    return rows, events
+    return rows, events, interactions.rows
 
 
 def main():
@@ -314,9 +391,10 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=list(DEFAULT_SEEDS))
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seconds", type=int, default=DEFAULT_SECONDS)
-    parser.add_argument("--capture", nargs="+", metavar="VEHICLE:TIME:LABEL",
+    parser.add_argument("--capture", nargs="+", metavar="VEHICLE:TIME:LABEL[:OTHER]",
                         help="Replay the first seed in SUMO GUI and save screenshots following each vehicle "
-                             "during the 10 s before TIME (every 1 s, then every step for the last 2 s)")
+                             "during the 10 s before TIME (every 1 s, then every step for the last 2 s); "
+                             "the vehicle is painted magenta and OTHER green")
     parser.add_argument("--zoom", type=float, default=1400)
     parser.add_argument("--leader-gap-geometry", action="store_true",
                         help="Measure the front gap from lane geometry when SUMO clamps it at 0")
@@ -330,7 +408,8 @@ def main():
     out = args.output.resolve()
     if args.capture:
         from tempfile import TemporaryDirectory
-        scenes = [(v, float(t), label) for v, t, label in (item.split(":") for item in args.capture)]
+        scenes = [(parts[0], float(parts[1]), parts[2], parts[3] if len(parts) > 3 else None)
+                  for parts in (item.split(":") for item in args.capture)]
         with TemporaryDirectory(prefix="sumo-review-") as work:
             cfg, flows, lanes = prepare_road(suite, Path(work), spec)
             run_road(cfg, flows, lanes, suite, model, vph, args.seconds, args.seeds[0],
@@ -339,19 +418,25 @@ def main():
         return
     out.mkdir(parents=True)
     cfg, flows, lanes = prepare_road(suite, out, spec)
-    rows, events = [], []
+    rows, events, inter = [], [], []
     with ProcessPoolExecutor(min(args.workers, len(args.seeds)), mp_context=get_context("spawn")) as pool:
         options = dict(leader_gap_geometry=args.leader_gap_geometry, lane_prior=args.lane_prior)
         for job in [pool.submit(run_road, cfg, flows, lanes, suite, model, vph, args.seconds, seed, None, options)
                     for seed in args.seeds]:
-            r, e = job.result()
+            r, e, i = job.result()
             rows.extend(r)
             events.extend(e)
+            inter.extend(i)
     with (out / "trips.csv").open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0]), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     (out / "events.json").write_text(json.dumps(events, indent=1), encoding="utf-8")
+    if inter:
+        with (out / "interactions.csv").open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=list(inter[0]), lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(inter)
     bc = Counter(r["status"] for r in rows if r["kind"] == "bc")
     print(f"BC trips: {dict(bc)} | events: {len(events)} | {out}", flush=True)
 
