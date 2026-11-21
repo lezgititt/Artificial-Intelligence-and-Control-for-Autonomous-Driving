@@ -158,6 +158,7 @@ class FixedTrafficSchedule(TrafficSchedule):
         self.origin_lanes = origin_lanes
 
     def spawn_due(self, api, now, prefix, rng):
+        requests = []
         while self.next_departure <= now:
             idx = self.cumulative.searchsorted(rng.random() * self.cumulative[-1], side="right")
             flow = self.flows[idx]
@@ -170,7 +171,9 @@ class FixedTrafficSchedule(TrafficSchedule):
                             departLane=lane, departSpeed=flow.speed)
             api.vehicle.setSpeedFactor(vid, float(np.clip(factor, .2, 2.0)))
             self.ids.add(vid)
+            requests.append((vid, flow.route, self.types[type_index]))
             self.next_departure += self._headway(rng)
+        return requests
 
 
 class FixedCaseSumo(ParallelSumo):
