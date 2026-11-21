@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from train_bc_actor import lane_class, export_policy, epoch
+from train_bc_actor import lane_class, export_policy, epoch, initialize_from_raw_policy
 from utils.bc_results import create_bc_result_dir
 from utils.networks import HybridActorCritic
 from train import HPARAMS
@@ -54,11 +54,12 @@ def main():
     p.add_argument('--batch-size',type=int,default=8192);p.add_argument('--lr',type=float,default=4.2e-4)
     p.add_argument('--seed',type=int,default=0);p.add_argument('--device',default='cuda');p.add_argument('--patience',type=int,default=100)
     p.add_argument('--hidden-sizes', nargs='+', type=int, default=HPARAMS['hidden_sizes'])
+    p.add_argument('--init-model', type=Path)
     a=p.parse_args();torch.set_num_threads(4);torch.manual_seed(a.seed);np.random.seed(a.seed)
     manifest=json.loads((a.data_dir/'manifest.json').read_text());collection=json.loads((a.data_dir/'config.json').read_text())
     paths=[a.data_dir/x for x in manifest['shards']];rng=np.random.default_rng(a.seed)
-    permutation=rng.permutation(len(paths));nval=max(1,round(.2*len(paths)))
-    val_indices=set(map(int,permutation[:nval]));train=[x for i,x in enumerate(paths) if i not in val_indices];val=[x for i,x in enumerate(paths) if i in val_indices]
+    permutation=rng.permutation(len(paths));nval=max(1,round(.05*len(paths)))
+    val_indices=set(manifest.get("validation_indices", map(int, permutation[:nval])));train=[x for i,x in enumerate(paths) if i not in val_indices];val=[x for i,x in enumerate(paths) if i in val_indices]
     if len(train)==0:raise ValueError('Need independent train/validation episodes')
     # Merge per-shard moments without retaining all observations in RAM/GPU.
     count=0;mean=np.zeros(manifest['obs_dim'],np.float64);m2=np.zeros_like(mean);counts=np.zeros(3,np.int64)
@@ -72,11 +73,15 @@ def main():
     a.out_dir = create_bc_result_dir(a.out_dir)
     device=torch.device(a.device);mt=torch.tensor(mean,device=device);st=torch.tensor(std,device=device);wt=torch.tensor(w,dtype=torch.float32,device=device)
     model=HybridActorCritic(manifest['obs_dim'],hidden_sizes=a.hidden_sizes,activation=HPARAMS['activation'],init_log_std=HPARAMS['init_log_std'],lane_keep_bias=HPARAMS['lane_keep_bias']).to(device)
-    with torch.no_grad():model.v_head.weight.zero_();model.v_head.bias.zero_()
+    if a.init_model:
+        state = torch.load(a.init_model, map_location=device, weights_only=True)
+        initialize_from_raw_policy(model, state, mt, st)
+    else:
+        with torch.no_grad():model.v_head.weight.zero_();model.v_head.bias.zero_()
     for param in model.v_head.parameters():param.requires_grad_(False)
     model.log_std.requires_grad_(False)
     optimizer=torch.optim.Adam([x for x in model.parameters() if x.requires_grad],lr=a.lr)
-    config=dict(data=str(a.data_dir/'manifest.json'),dataset_directory=str(a.data_dir.resolve()),init_model=None,
+    config=dict(data=str(a.data_dir/'manifest.json'),dataset_directory=str(a.data_dir.resolve()),init_model=str(a.init_model) if a.init_model else None,
                 algorithm='supervised_bc_on_ppo_hybrid_actor',observation_dim=manifest['obs_dim'],hidden_sizes=a.hidden_sizes,activation=HPARAMS['activation'],seed=a.seed,
                 observation_neighbor_distance_mode=collection['observation'].get('neighbor_distance_mode','legacy'),
                 collision_detection=collection.get('collision_detection'),
@@ -109,7 +114,7 @@ def main():
             if va['loss']<best:
                 best=va['loss'];best_epoch=e;torch.save(exported,a.out_dir/'model.pt')
                 torch.save(dict(state_dict=model.state_dict(),obs_mean=mt,obs_std=st,epoch=e),a.out_dir/'bc_training_state.pt')
-            result=dict(status='complete' if e==a.epochs or time.monotonic()>=deadline or e-best_epoch>=a.patience else 'training',best_epoch=best_epoch,best_val_loss=best,epochs_completed=e,wall_seconds=time.monotonic()-start,best_validation=history[best_epoch-1]['validation'],init_model=None)
+            result=dict(status='complete' if e==a.epochs or time.monotonic()>=deadline or e-best_epoch>=a.patience else 'training',best_epoch=best_epoch,best_val_loss=best,epochs_completed=e,wall_seconds=time.monotonic()-start,best_validation=history[best_epoch-1]['validation'],init_model=str(a.init_model) if a.init_model else None)
             (a.out_dir/'metrics.json').write_text(json.dumps(history,indent=2)+'\n');(a.out_dir/'result.json').write_text(json.dumps(result,indent=2)+'\n')
             print(f'Epoch {e}: train={tr["loss"]:.6f} val={va["loss"]:.6f} complete={tr["complete_pass"]} seconds={time.monotonic()-start:.1f}',flush=True)
             if time.monotonic()>=deadline or e-best_epoch>=a.patience:break

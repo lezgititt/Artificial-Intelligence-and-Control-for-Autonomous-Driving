@@ -189,6 +189,14 @@ class SumoHighwayEnv(gym.Env):
         if self.ring_distance_scale <= 0 or self.ring_visibility <= 0:
             raise ValueError("Ring observation scales must be positive")
         self._ring_geometry = {}
+        self.junction_neighbor_observation = bool(mdp_obs.get("junction_neighbor_observation", True))
+        self._neighbor_internal_links = {}
+        self._max_neighbor_length = float(ego.get("length", 5.))
+        if traffic is not None:
+            default_length = traffic.get("length", 5.)
+            self._max_neighbor_length = max(
+                self._max_neighbor_length, float(default_length),
+                *(float(c.get("length", default_length)) for c in traffic.get("controllers", {}).values()))
         self.visibility = float(mdp_obs["visibility"])   # 관측 거리 W
         # Saved datasets/models without this key keep their original encoding.
         self.neighbor_distance_mode = mdp_obs.get("neighbor_distance_mode", "legacy")
@@ -572,6 +580,44 @@ class SumoHighwayEnv(gym.Env):
         if (gap < 0 and not physical) or gap > self.visibility:
             return None
         return float(max(gap, 0) if physical else gap), self._api.vehicle.getSpeed(vid)
+
+    def _adjacent_junction_leader(self, offset):
+        """Measure the bumper gap along an adjacent lane's internal continuation."""
+        vehicle, lanes = self._api.vehicle, self._api.lane
+        edge = vehicle.getRoadID(self.ego_id)
+        index = vehicle.getLaneIndex(self.ego_id) + offset
+        if edge.startswith(":") or not 0 <= index < self._api.edge.getLaneNumber(edge):
+            return None
+        target = f"{edge}_{index}"
+        remaining = lanes.getLength(target) - vehicle.getLanePosition(self.ego_id)
+        if remaining > self.visibility + self._max_neighbor_length:
+            return None
+
+        best = None
+        for lane, distance in self._internal_lane_continuations(target).items():
+            for vid in lanes.getLastStepVehicleIDs(lane):
+                if vid == self.ego_id or vehicle.getLaneID(vid) != lane:
+                    continue
+                gap = remaining + distance + vehicle.getLanePosition(vid) - vehicle.getLength(vid)
+                if gap <= self.visibility and (best is None or gap < best[0]):
+                    best = (gap, vehicle.getSpeed(vid))
+        return (max(0., best[0]), best[1]) if best is not None else None
+
+    def _internal_lane_continuations(self, target):
+        """Find internal lanes reachable from the approach, without using the ego route."""
+        if target not in self._neighbor_internal_links:
+            lanes = self._api.lane
+            pending = [(link[4], 0.) for link in lanes.getLinks(target) if link[4]]
+            distances = {}
+            while pending:
+                lane, distance = pending.pop()
+                if not lane.startswith(":") or distance >= distances.get(lane, float("inf")):
+                    continue
+                distances[lane] = distance
+                end = distance + lanes.getLength(lane)
+                pending.extend((link[4], end) for link in lanes.getLinks(lane) if link[4])
+            self._neighbor_internal_links[target] = distances
+        return self._neighbor_internal_links[target]
 
     def _lane_follows_route(self, lane_id, *, reference_edge=None) -> bool:
         """이 차선이 ego 경로의 '다음 도로'로 이어지면 True."""
@@ -1261,6 +1307,10 @@ class SumoHighwayEnv(gym.Env):
         # ----- 5개 차선(좌2→좌1→현재→우1→우2)의 선행/후행 상대거리·상대속도 -----
         for offset in self.obs_offsets:
             lead = self._neighbor(offset, leader=True, physical=self.neighbor_distance_mode == "bumper")
+            if offset and self.neighbor_distance_mode == "bumper" and self.junction_neighbor_observation:
+                continued = self._adjacent_junction_leader(offset)
+                if continued is not None and (lead is None or continued[0] < lead[0]):
+                    lead = continued
             if lead is None:
                 obs += [1.0, 1.0]                  # 없음: 멀고 + 위협 없음
             else:

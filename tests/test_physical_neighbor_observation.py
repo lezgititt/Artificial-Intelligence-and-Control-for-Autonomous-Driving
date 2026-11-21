@@ -52,6 +52,27 @@ class PhysicalNeighborTests(unittest.TestCase):
         self.assertEqual(self.env._neighbor(-2, False, physical=True), (0., 1.))
 
 
+    def test_adjacent_leader_on_internal_lane_stays_visible(self):
+        lanes, edges = Mock(), Mock()
+        edges.getLaneNumber.return_value = 2
+        self.env._neighbor_internal_links = {}
+        self.env._max_neighbor_length = 5.
+        self.vehicle.getRoadID.return_value = "A5_in"
+        self.vehicle.getLaneIndex.return_value = 0
+        self.vehicle.getLanePosition.side_effect = {"ego": 34.6, "front": 1.5}.__getitem__
+        self.vehicle.getLength.return_value = 5.
+        self.vehicle.getLaneID.return_value = ":nC_5_1"
+        lanes.getLength.return_value = 35.6
+        lanes.getLinks.side_effect = lambda lane: (
+            [(None, None, None, None, ":nC_5_1")] if lane == "A5_in_1" else [])
+        lanes.getLastStepVehicleIDs.return_value = ["front"]
+        api = SimpleNamespace(vehicle=self.vehicle, lane=lanes, edge=edges)
+        with patch("env.sumo_env.traci", api):
+            self.assertEqual(self.env._adjacent_junction_leader(1), (0., 0.))
+            self.assertIsNone(self.env._adjacent_junction_leader(-1))
+        lanes.getLastStepVehicleIDs.assert_called_once_with(":nC_5_1")
+
+
 class CollisionGapConfigurationTests(unittest.TestCase):
     def test_all_expert_types_share_gap_without_changing_following_parameters(self):
         with TemporaryDirectory() as directory:

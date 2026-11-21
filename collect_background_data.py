@@ -132,7 +132,7 @@ def save_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
 
 
-def collect_episode(env, episode, seed, args, directory, extra_routes=None, traffic_schedule=None):
+def collect_episode(env, episode, seed, args, directory, extra_routes=None, traffic_schedule=None, dagger=None):
     lc_path = directory / f'lanechanges_{episode:03d}.xml'
     command = ['sumo', '-c', str(env.cfg_path), '--step-length', str(env.step_length),
                '--seed', str(seed), '--no-step-log', 'true', '--no-warnings', 'true',
@@ -158,9 +158,13 @@ def collect_episode(env, episode, seed, args, directory, extra_routes=None, traf
         base = Path(env.cfg_path).parent
         route_file = ET.parse(env.cfg_path).getroot().find("input/route-files").get("value")
         command += ["--route-files", f"{base / route_file},{extra_routes}"]
+    closed_only = getattr(args, "closed_trajectories", False)
     expert_entries = Counter()
-    if traffic_schedule is not None:
+    entered, endings = {}, {}
+    if traffic_schedule is not None and not closed_only:
         command += ["--max-depart-delay", "125"]
+    if dagger is not None:
+        command += ["--save-state.precision", "12", "--save-state.rng", "true"]
     libsumo.start(command)
     try:
         if traffic_schedule is not None:
@@ -183,6 +187,8 @@ def collect_episode(env, episode, seed, args, directory, extra_routes=None, traf
                 included = getattr(args, "include_vehicle_type", None)
                 excluded = getattr(args, "exclude_vehicle_type", ())
                 for vid in sorted(collect_ids):
+                    if closed_only and (vid not in entered or vid in endings):
+                        continue
                     vehicle_type = libsumo.vehicle.getTypeID(vid)
                     if (included is not None and vehicle_type != included) or vehicle_type in excluded:
                         continue
@@ -197,13 +203,31 @@ def collect_episode(env, episode, seed, args, directory, extra_routes=None, traf
                                    vehicle_type)
             if traffic_schedule is not None:
                 traffic_schedule.spawn_due(libsumo, libsumo.simulation.getTime(), str, rng)
+            if dagger is not None:
+                dagger.begin(env, before)
             libsumo.simulationStep()
+            labels = dagger.finish() if dagger is not None else {}
             if traffic_schedule is not None:
                 active = set(libsumo.vehicle.getIDList())
                 traffic_schedule.ids.intersection_update(active | set(libsumo.simulation.getPendingVehicles()))
+                if not closed_only:
+                    for vid in libsumo.simulation.getDepartedIDList():
+                        if vid.startswith("uniform_idm_"):
+                            expert_entries[traffic_schedule.controller.route_by_id[vid]] += 1
+            if closed_only:
+                vehicle = libsumo.vehicle
+                now = libsumo.simulation.getTime()
                 for vid in libsumo.simulation.getDepartedIDList():
-                    if vid.startswith("uniform_idm_"):
-                        expert_entries[traffic_schedule.controller.route_by_id[vid]] += 1
+                    if vid in active and vehicle.getTypeID(vid) == "car_idm":
+                        entered[vid] = (vehicle.getRouteID(vid), now)
+                for outcome, ids in (
+                    ("arrival", libsumo.simulation.getArrivedIDList()),
+                    ("collision", libsumo.simulation.getCollidingVehiclesIDList()),
+                    ("teleport", libsumo.simulation.getStartingTeleportIDList()),
+                ):
+                    for vid in ids:
+                        if vid in entered:
+                            endings.setdefault(vid, outcome)
             bad_vehicles.update(libsumo.simulation.getCollidingVehiclesIDList())
             bad_vehicles.update(libsumo.simulation.getStartingTeleportIDList())
             if not collecting:
@@ -215,6 +239,16 @@ def collect_episode(env, episode, seed, args, directory, extra_routes=None, traf
             alive = set(libsumo.vehicle.getIDList())
             after_time = libsumo.simulation.getTime()
             for vid, (obs, speed, road, lane, rid, vtype) in before.items():
+                if dagger is not None:
+                    if vid not in labels:
+                        counts["discard_missing_expert_label"] += 1
+                        continue
+                    accel, direction = labels[vid]
+                    acceleration = accel * (env.max_accel if accel >= 0 else env.max_decel)
+                    rows.append((obs, vid, after_time - env.step_length, accel, acceleration,
+                                 False, speed, speed + acceleration * env.step_length,
+                                 road, road, lane, lane, rid, vtype, True, direction))
+                    continue
                 if vid not in alive:
                     counts['disappeared_transitions'] += 1
                     continue
@@ -227,8 +261,13 @@ def collect_episode(env, episode, seed, args, directory, extra_routes=None, traf
                              acceleration, saturated, speed, libsumo.vehicle.getSpeed(vid), road,
                              libsumo.vehicle.getRoadID(vid), lane,
                              libsumo.vehicle.getLaneIndex(vid), rid, vtype,
-                             allowed.get(vid, True)))
+                             allowed.get(vid, True), None))
             if (tick - warmup_ticks + 1) % max(1, round(60/env.step_length)) == 0:
+                if closed_only:
+                    live = directory / f'progress_{episode:03d}.json'
+                    tmp = live.with_suffix('.tmp')
+                    save_json(tmp, dict(seconds=after_time, closed=dict(Counter(entered[v][0] for v in endings))))
+                    tmp.replace(live)
                 print(f'episode {episode}: {after_time-warmup:.0f}s, '
                       f'{len(rows):,} candidate pairs, {len(alive)} live vehicles', flush=True)
     finally:
@@ -240,8 +279,8 @@ def collect_episode(env, episode, seed, args, directory, extra_routes=None, traf
     selected, actions, physical, vehicles, steps, times, rids, types = [], [], [], [], [], [], [], []
     speeds, next_speeds = [], []
     allowed_labels = []
-    for obs, vid, t, accel, acceleration, saturated, speed0, speed1, road0, road1, lane0, lane1, rid, vtype, allowed in rows:
-        if vid in bad_vehicles:
+    for obs, vid, t, accel, acceleration, saturated, speed0, speed1, road0, road1, lane0, lane1, rid, vtype, allowed, expert_lane in rows:
+        if (closed_only and vid not in endings) or (not closed_only and vid in bad_vehicles):
             counts['discard_bad_vehicle'] += 1
             continue
         # Saturating an infeasible expert action would silently change its label.
@@ -251,10 +290,10 @@ def collect_episode(env, episode, seed, args, directory, extra_routes=None, traf
         if speed1 > env.vmax + 1e-5:
             counts['discard_speed_above_ego_limit'] += 1
             continue
-        direction = events.get((vid, round(t / env.step_length)), 0)
+        direction = expert_lane if expert_lane is not None else events.get((vid, round(t / env.step_length)), 0)
         if not allowed and direction:
             raise ValueError(f'Expert violated ego lane-change timing: {vid} t={t}')
-        if road0 == road1 and not road0.startswith(':'):
+        if expert_lane is None and road0 == road1 and not road0.startswith(':'):
             observed = lane1 - lane0
             if direction != observed:
                 raise ValueError(f'Lane-change timing mismatch: {vid} t={t}: '
@@ -284,6 +323,9 @@ def collect_episode(env, episode, seed, args, directory, extra_routes=None, traf
         data['lane_change_allowed'] = np.asarray(allowed_labels, np.bool_)
     if not env.observation_space.contains(data['observation'][0]):
         raise ValueError('Observation outside policy observation space')
+    if closed_only:
+        data["entry_time"] = np.asarray([entered[v][1] for v in vehicles])
+        data["termination"] = np.asarray([endings[v] for v in vehicles])
     np.savez_compressed(directory / f'episode_{episode:03d}.npz', **data)
     directions = data['action_raw'][:, 1]
     counts.update(samples=len(selected), vehicles=len(set(vehicles)),
@@ -300,7 +342,11 @@ def collect_episode(env, episode, seed, args, directory, extra_routes=None, traf
                   vehicle_types=dict(Counter(types)), bad_vehicle_ids=sorted(bad_vehicles),
                   wall_seconds=round(time.monotonic()-timing, 3))
     save_json(directory / f'episode_{episode:03d}.json', report)
-    if traffic_schedule is not None:
+    if closed_only:
+        report.update(trajectories_by_route=dict(Counter(entered[v][0] for v in set(vehicles))),
+                      cutoff_by_route=dict(Counter(route for v, (route, _) in entered.items() if v not in endings)))
+        save_json(directory / f'episode_{episode:03d}.json', report)
+    if traffic_schedule is not None and not closed_only:
         report.update(idm_entries_by_route=dict(expert_entries),
                       idm_requests_by_route=dict(traffic_schedule.uniform_idm.requests),
                       adaptive_requests=traffic_schedule.controller.stats["requested"])

@@ -119,6 +119,9 @@ def native_expert_worker(pipe, config, state_file, step_length, traffic_options,
             try:
                 libsumo.simulation.loadState(state_file)
                 vehicle = libsumo.vehicle
+                if spawn_protect is not None:
+                    restored = set(vehicle.getIDList())
+                    request = [row for row in request if row[0] in restored]
                 for vid, edge, _, _, _ in request:
                     if vehicle.getTypeID(vid) != "car_idm":
                         vehicle.setType(vid, "car_idm")

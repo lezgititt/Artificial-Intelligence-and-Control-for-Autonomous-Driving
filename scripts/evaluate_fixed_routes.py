@@ -453,7 +453,16 @@ def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, 
     reference = suite / "reference"
     spec = read_json(suite / "suite.json")
     cases = read_json(suite / "cases.json")
-    out = output if output is not None else suite / label
+    if output is None:
+        if model is None:
+            output = suite / label
+        else:
+            experiment = model.parent
+            if experiment.name == "training":
+                experiment = experiment.parent
+            output = experiment / (f"evaluation_{label}" if label else "evaluation")
+    out = output
+    label = label or out.name
     out.mkdir()
     context = out / "context"
     if model is not None:
@@ -519,10 +528,12 @@ def main():
                       help="Build the road from env/road_config.py instead of the reference's saved snapshot")
     evaluate = sub.add_parser("evaluate")
     evaluate.add_argument("suite", type=Path)
-    evaluate.add_argument("label")
+    evaluate.add_argument("label", nargs="?",
+                          help="Optional BC evaluation suffix (evaluation_<label>); required for expert evaluation")
     target = evaluate.add_mutually_exclusive_group(required=True)
     target.add_argument("--expert", choices=EXPERTS)
     target.add_argument("--model", type=Path)
+    evaluate.add_argument("--output", type=Path, help="Override the evaluation output directory")
     evaluate.add_argument("--replicas", type=int, default=MAX_REPLICAS_PER_WORKER,
                           help=f"Replicas per worker (default and maximum: {MAX_REPLICAS_PER_WORKER})")
     evaluate.add_argument("--smoke", type=int, default=0, help="Use only the first N cases per worker")
@@ -538,11 +549,14 @@ def main():
         prepare(suite, args.reference.resolve(strict=True), args.traffic_vph, args.adaptive_traffic,
                 args.uniform_idm_vph, traffic_seed=args.traffic_seed, current_road=args.current_road)
     else:
+        if args.expert and args.label is None:
+            parser.error("expert evaluation requires a label")
         if not 1 <= args.replicas <= MAX_REPLICAS_PER_WORKER or args.smoke < 0:
             parser.error(f"Expected 1–{MAX_REPLICAS_PER_WORKER} replicas and a nonnegative smoke-test count")
         run(suite, args.label, args.expert, args.model.resolve(strict=True) if args.model else None,
             args.replicas, args.smoke,
-            args.trace_failures_from.resolve(strict=True) if args.trace_failures_from else None)
+            args.trace_failures_from.resolve(strict=True) if args.trace_failures_from else None,
+            output=args.output.resolve() if args.output else None)
 
 
 if __name__ == "__main__":
