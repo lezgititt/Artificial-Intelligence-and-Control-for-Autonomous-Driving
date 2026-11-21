@@ -50,14 +50,25 @@ def prepare_road(suite, out, spec):
     return cfg, flows, {flow.route: lane_counts[routes[flow.route][0]] for flow in flows}
 
 
-def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed):
+def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=None):
     import torch
 
     torch.set_num_threads(1)
     road, _, _ = load_saved_configs(str(suite / "reference/model.pt"))
     _, mdp, train = load_saved_configs(str(model))
     actor = load_actor(model, train["HPARAMS"], "cpu").eval()
-    env = BackgroundObserver(str(cfg), road["ROAD"], road["EGO"], mdp["SIMULATION"],
+    api = libsumo
+    gui = gui_delay is not None
+    if gui:
+        import traci
+        api = traci
+
+    class MixedTrafficObserver(BackgroundObserver):
+        @property
+        def _api(self):
+            return api
+
+    env = MixedTrafficObserver(str(cfg), road["ROAD"], road["EGO"], mdp["SIMULATION"],
                              mdp["OBSERVATION"], mdp["ACTION"], train["REWARD"],
                              traffic=road["TRAFFIC"])
     env.lc_safety_enabled = False
@@ -83,25 +94,29 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed):
         raise ValueError("Simulation duration must be a multiple of the SUMO step length")
 
     def record(vid, entry, status, now):
-        rows.append(dict(seed=seed, vehicle=vid, route=entry["route"],
-                         request_s=entry["request_s"], departure_s=entry.get("departure_s"),
-                         start_lane=entry.get("start_lane"), end_s=now, status=status))
+        if not gui:
+            rows.append(dict(seed=seed, vehicle=vid, route=entry["route"],
+                             request_s=entry["request_s"], departure_s=entry.get("departure_s"),
+                             start_lane=entry.get("start_lane"), end_s=now, status=status))
 
-    libsumo.start(["sumo", "-c", str(cfg), "--step-length", str(env.step_length),
-                   "--seed", str(seed), "--no-step-log", "true", "--no-warnings", "true",
-                   "--collision.action", "remove", "--max-depart-delay", str(MAX_DEPART_DELAY)])
+    command = ["sumo-gui" if gui else "sumo", "-c", str(cfg), "--step-length", str(env.step_length),
+               "--seed", str(seed), "--no-step-log", "true", "--no-warnings", "true",
+               "--collision.action", "remove", "--max-depart-delay", str(MAX_DEPART_DELAY)]
+    if gui:
+        command += ["--start", "--delay", str(gui_delay), "--quit-on-end"]
+    api.start(command)
     try:
         for signal in signal_ids:
-            libsumo.trafficlight.setPhase(signal, phase)
-            libsumo.trafficlight.setPhaseDuration(signal, remaining)
-        schedule.reset(libsumo, 0, vph, rng, set())
+            api.trafficlight.setPhase(signal, phase)
+            api.trafficlight.setPhaseDuration(signal, remaining)
+        schedule.reset(api, 0, vph, rng, set())
         for _ in range(steps):
-            now = libsumo.simulation.getTime()
-            for vid, route, vehicle_type in schedule.spawn_due(libsumo, now, str, rng):
+            now = api.simulation.getTime()
+            for vid, route, vehicle_type in schedule.spawn_due(api, now, str, rng):
                 requests[vehicle_type] += 1
                 if vehicle_type == EGO_TYPE:
                     pending[vid] = dict(route=route, request_s=now)
-            env._active_ids = set(libsumo.vehicle.getIDList())
+            env._active_ids = set(api.vehicle.getIDList())
             before = {}
             if active:
                 with torch.inference_mode():
@@ -111,32 +126,32 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed):
                     env.ego_id = vid
                     before[vid] = env._prepare_step(action)
 
-            libsumo.simulationStep()
-            now = libsumo.simulation.getTime()
-            live = set(libsumo.vehicle.getIDList())
+            api.simulationStep()
+            now = api.simulation.getTime()
+            live = set(api.vehicle.getIDList())
             env._active_ids = live
-            collided = set(libsumo.simulation.getCollidingVehiclesIDList())
-            arrived = set(libsumo.simulation.getArrivedIDList())
-            departed = libsumo.simulation.getDepartedIDList()
-            teleported = set(libsumo.simulation.getStartingTeleportIDList())
+            collided = set(api.simulation.getCollidingVehiclesIDList())
+            arrived = set(api.simulation.getArrivedIDList())
+            departed = api.simulation.getDepartedIDList()
+            teleported = set(api.simulation.getStartingTeleportIDList())
             for vid in departed:
                 if vid in pending:
                     entry = pending.pop(vid)
                     entry["departure_s"] = now
                     active[vid] = entry
                     if vid in live:
-                        entry["start_lane"] = libsumo.vehicle.getLaneIndex(vid)
-                        libsumo.vehicle.setSpeedMode(vid, 0)
-                        libsumo.vehicle.setLaneChangeMode(vid, 0)
+                        entry["start_lane"] = api.vehicle.getLaneIndex(vid)
+                        api.vehicle.setSpeedMode(vid, 0)
+                        api.vehicle.setLaneChangeMode(vid, 0)
                 if vid in live:
-                    departures[libsumo.vehicle.getTypeID(vid)] += 1
+                    departures[api.vehicle.getTypeID(vid)] += 1
             for vid, entry in list(active.items()):
                 env.ego_id = vid
                 status = None
                 if vid in before and vid in live:
                     signals, _, distance = before[vid][6:9]
                     if signals:
-                        traveled = libsumo.vehicle.getDistance(vid) - distance
+                        traveled = api.vehicle.getDistance(vid) - distance
                         if any(traveled > stop + 1e-6 and env._crossing_signal_color(tls, link, color) == "r"
                                for tls, link, stop, color in signals):
                             status = "red_light"
@@ -157,14 +172,16 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed):
                     record(vid, entry, status, now)
                     del active[vid]
                     if vid in live or vid in teleported:
-                        libsumo.vehicle.remove(vid)
+                        api.vehicle.remove(vid)
             for vid, entry in list(pending.items()):
                 if now - entry["request_s"] > MAX_DEPART_DELAY + 2 * env.step_length:
                     record(vid, entry, "not_inserted", now)
                     del pending[vid]
             schedule.ids.clear()
     finally:
-        libsumo.close()
+        api.close()
+    if gui:
+        return
     print(f"Seed {seed}: {dict(Counter(row['status'] for row in rows))}, "
           f"cut off: {len(active)} driving, {len(pending)} awaiting insertion", flush=True)
     if len(rows) + len(active) + len(pending) != requests[EGO_TYPE]:
