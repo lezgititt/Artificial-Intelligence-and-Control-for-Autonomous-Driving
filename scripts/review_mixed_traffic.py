@@ -97,13 +97,15 @@ class Interactions:
 
     overtake: a vehicle changes lane while its leader (within 40 m) is slower, and within 30 s
               it is ahead of that former leader on the same road.
+    return:   after a successful overtake, the vehicle changes lane again within 20 s and the
+              overtaken vehicle becomes its direct follower (it cut back in front of it).
     cut-in:   another vehicle changes into the lane right in front (gap < 15 m) while this one
               drives faster than 3 m/s; the next 10 s show how it reacted.
     """
     def __init__(self, kinds):
         self.kinds = kinds          # vehicle id -> kind ("bc", "idm", ...)
         self.state = {}             # vehicle id -> (edge, lane index, lane id, leader id, gap, leader speed, speed)
-        self.overtakes, self.cutins, self.rows = [], [], []
+        self.overtakes, self.cutins, self.returns, self.rows = [], [], [], []
 
     def step(self, api, now, live, previous, collided, seed):
         for vid in live:
@@ -140,6 +142,26 @@ class Interactions:
             if result:
                 self.overtakes.remove(item)
                 self._row(seed, "overtake", item, result, now)
+                if result == "passed":
+                    self.returns.append(dict(item, t=now, until=now + 20, passed_lane=api.vehicle.getLaneIndex(vid)))
+        for item in list(self.returns):
+            vid, other = item["vid"], item["other"]
+            result = None
+            if vid in collided:
+                result = "collision"
+            elif vid not in live or other not in live:
+                result = "unresolved"
+            else:
+                follower = api.vehicle.getFollower(vid, 50.0)
+                if (follower and follower[0] == other
+                        and api.vehicle.getLaneIndex(vid) != item["passed_lane"]):
+                    item["gap0"] = follower[1]
+                    result = "returned_in_front"
+                elif now >= item["until"]:
+                    result = "stayed"
+            if result:
+                self.returns.remove(item)
+                self._row(seed, "return_after_overtake", item, result, now)
         for item in list(self.cutins):
             vid, other = item["vid"], item["other"]
             if vid in live:
@@ -239,6 +261,7 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, capture=None, 
     trips, history, rows, events = {}, {}, [], []
     kinds = {}
     interactions = Interactions(kinds)
+    traced = []
     command = ["sumo-gui" if capture else "sumo", "-c", str(cfg), "--step-length", str(step), "--seed", str(seed),
                "--no-step-log", "true", "--no-warnings", "true", "--collision.action", "remove",
                "--max-depart-delay", str(MAX_DEPART_DELAY)]
@@ -321,6 +344,14 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, capture=None, 
                     if vid in trips:
                         trips[vid].update(api, vid, now, step)
                 interactions.step(api, now, live, previous, collided, seed)
+                for vid in options.get("trace", ()):
+                    if vid in live:
+                        x, y = api.vehicle.getPosition(vid)
+                        traced.append(dict(t=now, vehicle=vid, x=round(x, 2), y=round(y, 2),
+                                           lane=api.vehicle.getLaneID(vid), speed=round(api.vehicle.getSpeed(vid), 2),
+                                           angle=round(api.vehicle.getAngle(vid), 1)))
+                if options.get("trace_until") and now >= options["trace_until"]:
+                    break
 
             def close(vid, status):
                 trip = trips.pop(vid, None)
@@ -379,6 +410,8 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, capture=None, 
     finally:
         api.close()
     print(f"Seed {seed}: BC {dict(Counter(r['status'] for r in rows if r['kind'] == 'bc'))}", flush=True)
+    if options.get("trace_file"):
+        Path(options["trace_file"]).write_text(json.dumps(traced), encoding="utf-8")
     return rows, events, interactions.rows
 
 
