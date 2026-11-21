@@ -76,7 +76,7 @@ def use_current_road(context):
 
 
 def prepare(suite, reference, traffic_vph, adaptive=False, uniform_idm_vph=0, *,
-            traffic_seed=0, current_road=False):
+            traffic_seed=0, current_road=False, background_idm_only=False):
     context = suite / "reference"
     if (reference / "evaluation_config.json").is_file():
         shutil.copytree(reference, context)
@@ -85,6 +85,10 @@ def prepare(suite, reference, traffic_vph, adaptive=False, uniform_idm_vph=0, *,
         _, curriculum, _ = fixed_start_context(reference, context, max_vph=traffic_vph)
     if current_road:
         use_current_road(context)
+    if background_idm_only:
+        with (context / "road_config.py").open("a", encoding="utf-8") as file:
+            file.write("\nTRAFFIC['controllers'] = {'idm': dict(TRAFFIC['controllers']['idm'], probability=1.0)}\n"
+                       "TRAFFIC['lc_speed_gain'] = 1.0\n")
     curriculum = replace(curriculum, max_vph=traffic_vph, snapshot_warmup_seconds=800)
     if adaptive:
         curriculum = replace(curriculum, total_vph=True, max_depart_delay_seconds=125)
@@ -529,6 +533,8 @@ def main():
                       help="Vary the warm-up traffic states and spawn streams (0 = original benchmark)")
     init.add_argument("--current-road", action="store_true",
                       help="Build the road from env/road_config.py instead of the reference's saved snapshot")
+    init.add_argument("--background-idm-only", action="store_true",
+                      help="Use only IDM background vehicles, with lcSpeedGain=1.0")
     evaluate = sub.add_parser("evaluate")
     evaluate.add_argument("suite", type=Path)
     evaluate.add_argument("label", nargs="?",
@@ -549,8 +555,11 @@ def main():
             parser.error("--traffic-vph must be positive")
         if not 0 <= args.uniform_idm_vph < args.traffic_vph or (args.uniform_idm_vph and not args.adaptive_traffic):
             parser.error("--uniform-idm-vph requires adaptive traffic and must be below --traffic-vph")
+        if args.background_idm_only and (args.adaptive_traffic or args.uniform_idm_vph):
+            parser.error("--background-idm-only requires fixed traffic")
         prepare(suite, args.reference.resolve(strict=True), args.traffic_vph, args.adaptive_traffic,
-                args.uniform_idm_vph, traffic_seed=args.traffic_seed, current_road=args.current_road)
+                args.uniform_idm_vph, traffic_seed=args.traffic_seed, current_road=args.current_road,
+                background_idm_only=args.background_idm_only)
     else:
         if args.expert and args.label is None:
             parser.error("expert evaluation requires a label")

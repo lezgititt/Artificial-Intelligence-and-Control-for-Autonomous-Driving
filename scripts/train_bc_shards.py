@@ -55,7 +55,11 @@ def main():
     p.add_argument('--seed',type=int,default=0);p.add_argument('--device',default='cuda');p.add_argument('--patience',type=int,default=100)
     p.add_argument('--hidden-sizes', nargs='+', type=int, default=HPARAMS['hidden_sizes'])
     p.add_argument('--init-model', type=Path)
+    p.add_argument('--lane-weight-root', type=int, default=2,
+                   help='Root of inverse lane class frequency (default: 2)')
     a=p.parse_args();torch.set_num_threads(4);torch.manual_seed(a.seed);np.random.seed(a.seed)
+    if a.lane_weight_root < 1:
+        p.error('--lane-weight-root must be at least 1')
     manifest=json.loads((a.data_dir/'manifest.json').read_text());collection=json.loads((a.data_dir/'config.json').read_text())
     paths=[a.data_dir/x for x in manifest['shards']];rng=np.random.default_rng(a.seed)
     permutation=rng.permutation(len(paths));nval=max(1,round(.05*len(paths)))
@@ -69,7 +73,9 @@ def main():
         mean+=delta*n/(count+n);count+=n;counts+=np.bincount(lane_class(act),minlength=3)
     if (counts==0).any():raise ValueError(f'Missing lane class: {counts}')
     std=np.sqrt(np.maximum(m2/count,0));std=np.where(std<1e-6,1,std)
-    mean=mean.astype(np.float32);std=std.astype(np.float32);w=np.sqrt(count/(3*counts));w=w/w.mean()
+    mean=mean.astype(np.float32);std=std.astype(np.float32)
+    w = np.power(count / (3 * counts), 1 / a.lane_weight_root)
+    w /= w.mean()
     a.out_dir = create_bc_result_dir(a.out_dir)
     device=torch.device(a.device);mt=torch.tensor(mean,device=device);st=torch.tensor(std,device=device);wt=torch.tensor(w,dtype=torch.float32,device=device)
     model=HybridActorCritic(manifest['obs_dim'],hidden_sizes=a.hidden_sizes,activation=HPARAMS['activation'],init_log_std=HPARAMS['init_log_std'],lane_keep_bias=HPARAMS['lane_keep_bias']).to(device)
@@ -88,7 +94,8 @@ def main():
                 epochs=a.epochs,wall_seconds=a.wall_seconds,batch_size=a.batch_size,lr=a.lr,train_samples=count,
                 validation_samples=manifest['samples']-count,train_episodes=[i for i in range(len(paths)) if i not in val_indices],validation_episodes=sorted(val_indices),
                 lane_class_order=['left','keep','right'],train_lane_counts=counts.tolist(),lane_weights=w.tolist(),
-                loss='accel_mse + sqrt_inverse_frequency_lane_ce',storage='episode_npz_shards',
+                lane_weight_root=a.lane_weight_root,
+                loss='accel_mse + inverse_frequency_lane_ce',storage='episode_npz_shards',
                 collection_manifest_sha256=hashlib.sha256((a.data_dir/'manifest.json').read_bytes()).hexdigest())
     (a.out_dir/'config.json').write_text(json.dumps(config,indent=2)+'\n');np.savez(a.out_dir/'normalization.npz',mean=mean,std=std)
     for source in ['env/road_config.py','env/mdp_config.py','train.py','scripts/train_bc_shards.py','env/ring_observation.py']:
