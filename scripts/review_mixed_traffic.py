@@ -101,11 +101,119 @@ class Interactions:
               overtaken vehicle becomes its direct follower (it cut back in front of it).
     cut-in:   another vehicle changes into the lane right in front (gap < 15 m) while this one
               drives faster than 3 m/s; the next 10 s show how it reacted.
+    merge:    a vehicle approaching a lane end whose link to its route has no priority (slip-road
+              merges, permissive turns) slows below 2 m/s within 25 m of the end; vehicles on the
+              other lanes feeding the same target lane that cross in front meanwhile are counted as
+              yielded to. The event closes when it enters the junction; 5 s later checks for a crash.
+    queue:    a vehicle comes to a stop behind a stopped leader within 20 m (gap at the stop).
+    start-up: a vehicle stopped right behind a stopped leader; time from the leader moving
+              (> 1 m/s) to the vehicle moving (> 1 m/s).
     """
     def __init__(self, kinds):
         self.kinds = kinds          # vehicle id -> kind ("bc", "idm", ...)
         self.state = {}             # vehicle id -> (edge, lane index, lane id, leader id, gap, leader speed, speed)
         self.overtakes, self.cutins, self.returns, self.rows = [], [], [], []
+        self.links, self.lengths, self.reverse, self.signal_lanes = {}, {}, None, None
+        self.merges, self.merged, self.waiting = {}, [], {}
+
+    def _links(self, api, lane):
+        if lane not in self.links:
+            self.links[lane] = api.lane.getLinks(lane)
+        return self.links[lane]
+
+    def _length(self, api, lane):
+        if lane not in self.lengths:
+            self.lengths[lane] = api.lane.getLength(lane)
+        return self.lengths[lane]
+
+    def _sources(self, api, target):
+        if self.reverse is None:
+            self.reverse = {}
+            for lane in api.lane.getIDList():
+                if not lane.startswith(":"):
+                    for link in self._links(api, lane):
+                        self.reverse.setdefault(link[0], set()).add(lane)
+        return self.reverse.get(target, set())
+
+    def _merge_step(self, api, now, vid, lane, speed, live):
+        wait = self.merges.get(vid)
+        if wait is not None and wait["lane"] != lane:
+            del self.merges[vid]
+            if lane.startswith(":") or lane.rsplit("_", 1)[0] == wait["target"].rsplit("_", 1)[0]:
+                wait["entered"] = now
+                self.merged.append(wait)
+            return
+        if lane.startswith(":"):
+            return
+        remaining = self._length(api, lane) - api.vehicle.getLanePosition(vid)
+        if wait is None:
+            if speed >= 2.0 or remaining >= 25:
+                return
+            route, index = api.vehicle.getRoute(vid), api.vehicle.getRouteIndex(vid)
+            nxt = route[index + 1] if 0 <= index < len(route) - 1 else None
+            if self.signal_lanes is None:
+                self.signal_lanes = {l for tls in api.trafficlight.getIDList()
+                                     for l in api.trafficlight.getControlledLanes(tls)}
+            if lane in self.signal_lanes:
+                return      # waiting at a signal is not yielding
+            links = [link for link in self._links(api, lane) if nxt and link[0].rsplit("_", 1)[0] == nxt]
+            if not links or any(link[1] for link in links):
+                return
+            target = links[0][0]
+            wait = self.merges[vid] = dict(vid=vid, lane=lane, target=target, t=now, last=now, stopped=0.0,
+                                           min_speed=speed, foes=self._sources(api, target) - {lane},
+                                           near=set(), passed=[])
+        step = now - wait["last"]
+        wait["last"] = now
+        wait["min_speed"] = min(wait["min_speed"], speed)
+        if speed < 0.5:
+            wait["stopped"] += step
+        target_edge = wait["target"].rsplit("_", 1)[0]
+        near = set()
+        for foe_lane in wait["foes"]:
+            end = self._length(api, foe_lane)
+            for other in api.lane.getLastStepVehicleIDs(foe_lane):
+                if end - api.vehicle.getLanePosition(other) < 40:
+                    route, index = api.vehicle.getRoute(other), api.vehicle.getRouteIndex(other)
+                    if 0 <= index < len(route) - 1 and route[index + 1] == target_edge:
+                        near.add(other)
+        for other in wait["near"] - near:
+            if other in live and api.vehicle.getLaneID(other) not in wait["foes"]:
+                wait["passed"].append(other)
+        wait["near"] = near
+
+    def _close_merges(self, now, live, collided, seed):
+        for wait in list(self.merged):
+            vid = wait["vid"]
+            result = "collision" if vid in collided else (
+                "merged" if now - wait["entered"] >= 5 or vid not in live else None)
+            if result:
+                self.merged.remove(wait)
+                first = wait["passed"][0] if wait["passed"] else ""
+                self._row(seed, "merge", dict(vid=vid, other=first, t=wait["t"]), result, now,
+                          extra=dict(lane=wait["lane"], target=wait["target"], yielded=len(wait["passed"]),
+                                     yielded_ids=wait["passed"][:6], stopped_s=round(wait["stopped"], 1),
+                                     min_speed=round(wait["min_speed"], 2), entered=wait["entered"]))
+
+    def _queue_step(self, api, now, vid, speed, old, leader, gap, lead_speed, seed):
+        if (old and old[6] >= 0.5 and speed < 0.5 and leader and gap is not None and gap < 20
+                and lead_speed is not None and lead_speed < 0.5):
+            signals = api.vehicle.getNextTLS(vid)
+            red = bool(signals) and signals[0][2] < 120 and signals[0][3].lower() in "ry"
+            self._row(seed, "queue_stop", dict(vid=vid, other=leader, t=now, gap0=gap), "stopped", now,
+                      extra=dict(at_red=red, min_gap_param=api.vehicle.getMinGap(vid)))
+        wait = self.waiting.get(vid)
+        if speed < 0.5 and leader and gap is not None and gap < 15 and lead_speed is not None:
+            if wait is None or wait["other"] != leader:
+                wait = self.waiting[vid] = dict(vid=vid, other=leader, t=None)
+            if wait["t"] is None and lead_speed > 1.0:
+                wait["t"] = now
+        elif wait is not None:
+            if wait["t"] is not None and speed > 1.0:
+                self._row(seed, "start_up", dict(vid=vid, other=wait["other"], t=wait["t"]), "started", now,
+                          extra=dict(delay_s=round(now - wait["t"], 1)))
+            if speed > 1.0 or leader != wait["other"]:
+                del self.waiting[vid]
 
     def step(self, api, now, live, previous, collided, seed):
         for vid in live:
@@ -126,7 +234,16 @@ class Interactions:
                   and previous[leader][1].rsplit("_", 1)[0] == edge and not edge.startswith(":")):
                 self.cutins.append(dict(vid=vid, other=leader, t=now, until=now + 10, gap0=gap, v0=speed,
                                         min_gap=gap, min_speed=speed))
+            self._merge_step(api, now, vid, lane, speed, live)
+            self._queue_step(api, now, vid, speed, old, leader, gap, lead_speed, seed)
             self.state[vid] = (edge, index, lane, leader, gap, lead_speed, speed)
+        for vid in list(self.merges):
+            if vid not in live:
+                wait = self.merges.pop(vid)
+                if vid in collided:
+                    self._row(seed, "merge", dict(vid=vid, other="", t=wait["t"]), "collision_waiting", now,
+                              extra=dict(lane=wait["lane"], yielded=len(wait["passed"])))
+        self._close_merges(now, live, collided, seed)
         for item in list(self.overtakes):
             vid, other = item["vid"], item["other"]
             result = None
@@ -175,14 +292,15 @@ class Interactions:
                 self.cutins.remove(item)
                 self._row(seed, "cut_in_ahead", item, result, now)
 
-    def _row(self, seed, kind, item, result, now):
+    def _row(self, seed, kind, item, result, now, extra=None):
         self.rows.append(dict(seed=seed, event=kind, vehicle=item["vid"], kind=self.kinds.get(item["vid"]),
                               other=item["other"], other_kind=self.kinds.get(item["other"], "?"), t=item["t"],
                               result=result, resolved_s=round(now - item["t"], 1),
                               own_speed=round(item.get("own", item.get("v0", 0)), 2),
                               other_speed=round(item.get("other_speed", 0), 2),
                               gap0=round(item.get("gap0", -1), 2), min_gap=round(item.get("min_gap", -1), 2),
-                              speed_drop=round(item.get("v0", 0) - item.get("min_speed", 0), 2)))
+                              speed_drop=round(item.get("v0", 0) - item.get("min_speed", 0), 2),
+                              extra=json.dumps(extra or {}, ensure_ascii=False)))
 
 
 def snapshot(api, vid, now, action=None):
@@ -320,7 +438,7 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, capture=None, 
                             api.vehicle.setColor(other, (0, 230, 0, 255))
                         if capture.get("road_right"):
                             # Rotate the view so the vehicle drives towards the right of the picture.
-                            api.gui.setAngle("View #0", capture.setdefault("angle", api.vehicle.getAngle(vid) - 90))
+                            api.gui.setAngle("View #0", capture.setdefault("angles", {}).setdefault(label, api.vehicle.getAngle(vid) - 90))
                         api.gui.setZoom("View #0", capture.get("zoom", 1400))
                         api.gui.setOffset("View #0", x, y)
                         api.gui.screenshot("View #0", str(Path(capture["out"]) / f"{label}_{vid}_t{now:07.1f}.png"))
@@ -453,7 +571,7 @@ def main():
         from tempfile import TemporaryDirectory
         scenes = [(parts[0], float(parts[1]), parts[2], parts[3] if len(parts) > 3 else None)
                   for parts in (item.split(":") for item in args.capture)]
-        with TemporaryDirectory(prefix="sumo-review-") as work:
+        with TemporaryDirectory(prefix="sumo-review-", ignore_cleanup_errors=True) as work:
             cfg, flows, lanes = prepare_road(suite, Path(work), spec)
             run_road(cfg, flows, lanes, suite, model, vph, args.seconds, args.seeds[0],
                      capture=dict(out=out, scenes=scenes, zoom=args.zoom, gray_others=args.gray_others,
