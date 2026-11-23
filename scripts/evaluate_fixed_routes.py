@@ -146,7 +146,7 @@ def prepare(suite, reference, traffic_vph, adaptive=False, uniform_idm_vph=0, *,
         collision_detection=gaps, simulation_step_seconds=STEP, max_seconds=500,
         max_replicas_per_worker=MAX_REPLICAS_PER_WORKER, workers=4, seeds_per_snapshot=1,
         snapshot_times_seconds=SNAPSHOT_TIMES,
-        spawn_protect_m=30))
+        spawn_protect_m=0))
     print(f"Prepared {len(cases):,} cases in {suite}", flush=True)
 
 
@@ -294,7 +294,7 @@ def audit_state(ego, reference_signals=()):
                 reference_signal_states=signal_states)
 
 
-def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace_ids=()):
+def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace_ids, spawn_protect_m):
     import torch
 
     torch.set_num_threads(1)
@@ -315,6 +315,7 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
         randomize_departures=False, independent_episode_rng=True,
         traffic_curriculum=curriculum, fixed_traffic_vph=traffic_vph,
         traffic_snapshot_path=str(suite / "traffic_states.sqlite"))
+    env.prototype.lc_spawn_protect = spawn_protect_m
     env.expert_type = expert_type
     env.adaptive_factory = None
     if spec.get("adaptive_traffic"):
@@ -455,7 +456,8 @@ def plot_summary(out, label, rows, summary, routes, model_run):
     plt.close(fig)
 
 
-def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, *, output=None):
+def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, *, output=None,
+        spawn_protect_m=0.):
     started = perf_counter()
     reference = suite / "reference"
     spec = read_json(suite / "suite.json")
@@ -487,7 +489,7 @@ def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, 
     print(f"{label}: {sum(map(len, shards)):,} cases, {replicas} replicas/worker", flush=True)
     with ProcessPoolExecutor(4, mp_context=get_context("spawn")) as pool:
         futures = [pool.submit(evaluate_worker, suite, context, out / f"worker_{i}",
-                               shard, expert, replicas, trace_ids) for i, shard in enumerate(shards)]
+                               shard, expert, replicas, trace_ids, spawn_protect_m) for i, shard in enumerate(shards)]
         rows = sorted((row for job in as_completed(futures) for row in job.result()), key=lambda r: r["case_id"])
     expected = {c["case_id"] for shard in shards for c in shard}
     if len(rows) != len(expected) or {r["case_id"] for r in rows} != expected:
@@ -501,7 +503,8 @@ def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, 
     summary = dict(label=label, expert=expert, checkpoint=str(model) if model else None,
                    checkpoint_sha256=hashlib.sha256(model.read_bytes()).hexdigest() if model else None,
                    evaluated_epoch=evaluated_epoch,
-                   conditions=spec | {"replicas_per_worker": replicas}, overall=summarize(rows),
+                   conditions=spec | {"replicas_per_worker": replicas, "spawn_protect_m": spawn_protect_m},
+                   overall=summarize(rows),
                    by_route={route: summarize([r for r in rows if r["route"] == route]) for route in routes},
                    elapsed_seconds=round(perf_counter() - started, 2))
     if trace_failures_from is not None:
@@ -543,6 +546,8 @@ def main():
     target.add_argument("--expert", choices=EXPERTS)
     target.add_argument("--model", type=Path)
     evaluate.add_argument("--output", type=Path, help="Override the evaluation output directory")
+    evaluate.add_argument("--spawn-protect-m", type=float, default=0.,
+                          help="Initial lane-change restriction in meters (default: 0, disabled)")
     evaluate.add_argument("--replicas", type=int, default=MAX_REPLICAS_PER_WORKER,
                           help=f"Replicas per worker (default and maximum: {MAX_REPLICAS_PER_WORKER})")
     evaluate.add_argument("--smoke", type=int, default=0, help="Use only the first N cases per worker")
@@ -563,12 +568,14 @@ def main():
     else:
         if args.expert and args.label is None:
             parser.error("expert evaluation requires a label")
+        if not np.isfinite(args.spawn_protect_m) or args.spawn_protect_m < 0:
+            parser.error("--spawn-protect-m must be finite and nonnegative")
         if not 1 <= args.replicas <= MAX_REPLICAS_PER_WORKER or args.smoke < 0:
             parser.error(f"Expected 1–{MAX_REPLICAS_PER_WORKER} replicas and a nonnegative smoke-test count")
         run(suite, args.label, args.expert, args.model.resolve(strict=True) if args.model else None,
             args.replicas, args.smoke,
             args.trace_failures_from.resolve(strict=True) if args.trace_failures_from else None,
-            output=args.output.resolve() if args.output else None)
+            output=args.output.resolve() if args.output else None, spawn_protect_m=args.spawn_protect_m)
 
 
 if __name__ == "__main__":

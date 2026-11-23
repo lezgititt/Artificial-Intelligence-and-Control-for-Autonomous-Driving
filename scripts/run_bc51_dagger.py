@@ -95,8 +95,8 @@ class DaggerSumo(ParallelSumo):
                                    arrived=ego.ego_id in arrived)
 
 
-def load_actor(checkpoint, hparams, device):
-    actor = PPO(obs_dim=51, act_dim=2, **(hparams | {"device": device})).policy
+def load_actor(checkpoint, hparams, device, *, obs_dim=51):
+    actor = PPO(obs_dim=obs_dim, act_dim=2, **(hparams | {"device": device})).policy
     actor.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
     return actor
 

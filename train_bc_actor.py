@@ -49,7 +49,7 @@ def initialize_from_raw_policy(model, state, mean, std):
     model.load_state_dict(state)
 
 
-def epoch(model, x, accel, lane, weights, batch_size, optimizer=None):
+def epoch(model, x, accel, lane, weights, batch_size, optimizer=None, *, accel_weights=None):
     train=optimizer is not None
     model.train(train)
     order=torch.randperm(len(x),device=x.device) if train else torch.arange(len(x),device=x.device)
@@ -62,7 +62,11 @@ def epoch(model, x, accel, lane, weights, batch_size, optimizer=None):
             mu,_,logits,_=model(x[idx])
             errors=(mu.squeeze(-1)-accel[idx]).square()
             losses=F.cross_entropy(logits,lane[idx],weight=weights,reduction='none')
-            loss=errors.mean()+losses.sum()/weights[lane[idx]].sum()
+            accel_loss = errors.mean()
+            if accel_weights is not None:
+                batch_weights = accel_weights[idx]
+                accel_loss = (errors * batch_weights).sum() / batch_weights.sum()
+            loss=accel_loss+losses.sum()/weights[lane[idx]].sum()
             if not torch.isfinite(loss):
                 raise ValueError('Nonfinite BC loss')
             if train:

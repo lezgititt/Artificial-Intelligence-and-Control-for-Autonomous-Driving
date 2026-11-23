@@ -77,12 +77,14 @@ class DaggerTeacher:
             self.worker.join()
 
 
-def collect(suite, cfg, flows, output, index, observation=None, traffic_vph=4740, dagger_base=None):
+def collect(suite, cfg, flows, output, index, observation=None, traffic_vph=4740, dagger_base=None,
+            idm_spawn_protect_m=None):
     road, mdp, train = load_saved_configs(str(suite / "reference/model.pt"))
     env = BackgroundObserver(str(cfg), road["ROAD"], road["EGO"], mdp["SIMULATION"],
                              observation or mdp["OBSERVATION"], mdp["ACTION"], train["REWARD"], traffic=road["TRAFFIC"])
     args = SimpleNamespace(traffic_vph=traffic_vph, seconds=3600, closed_trajectories=True,
-                           include_vehicle_type="car_idm")
+                           include_vehicle_type="car_idm", spawn_protect_m=idm_spawn_protect_m,
+                           spawn_protect_vehicle_type="car_idm")
     kwargs = dict(traffic_schedule=TrafficSchedule(flows))
     if dagger_base is None:
         return collect_episode(env, index, 99000 + index, args, output, **kwargs)
@@ -155,10 +157,27 @@ def main():
     parser.add_argument("--train-quota", type=int)
     parser.add_argument("--validation-quota", type=int)
     parser.add_argument("--dagger-base", type=Path)
+    gap_mode = parser.add_mutually_exclusive_group()
+    gap_mode.add_argument("--leader-gap-geometry", action="store_true",
+                          help="Measure clamped front gaps from lane geometry during collection")
+    gap_mode.add_argument("--connected-lane-bumper-gaps", action="store_true",
+                          help="Measure all five lanes' bumper gaps along connected lane segments")
+    parser.add_argument("--signed-adjacent-gaps", action="store_true",
+                        help="Preserve signed overlap for adjacent front and rear gaps")
+    parser.add_argument("--idm-spawn-protect-m", type=float,
+                        help="Block IDM lane changes at entry and append normalized entry progress")
     parser.add_argument("--finetune-lr", type=float, default=3e-5)
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--lane-weight-root", type=int, default=2)
     parser.add_argument("--eval-smoke", type=int, default=0)
     args = parser.parse_args()
+    if args.lane_weight_root < 1:
+        parser.error("--lane-weight-root must be at least 1")
+    if args.signed_adjacent_gaps and not args.connected_lane_bumper_gaps:
+        parser.error("--signed-adjacent-gaps requires --connected-lane-bumper-gaps")
+    if args.idm_spawn_protect_m is not None and (
+            not np.isfinite(args.idm_spawn_protect_m) or args.idm_spawn_protect_m <= 0 or args.dagger_base):
+        parser.error("--idm-spawn-protect-m requires a positive finite distance and native IDM collection")
     quotas = {"train": args.train_quota, "validation": args.validation_quota}
     balanced = any(x is not None for x in quotas.values())
     if balanced and any(x is None or x < 1 for x in quotas.values()):
@@ -196,12 +215,22 @@ def main():
     validation_runs = {0 if args.eval_smoke else int(split_rng.integers(20))}
     road, mdp, _ = load_saved_configs(str(suite / "reference/model.pt"))
     observation = dict(mdp["OBSERVATION"], ring_merge_scope="direct", junction_neighbor_observation=True) if balanced else None
+    if args.leader_gap_geometry:
+        observation = dict(observation if observation is not None else mdp["OBSERVATION"],
+                           leader_gap_geometry=True)
+    if args.connected_lane_bumper_gaps:
+        observation = dict(observation if observation is not None else mdp["OBSERVATION"],
+                           connected_lane_bumper_gaps=True, leader_gap_geometry=False,
+                           signed_adjacent_gaps=args.signed_adjacent_gaps)
+    if args.idm_spawn_protect_m is not None:
+        observation = dict(observation if observation is not None else mdp["OBSERVATION"],
+                           spawn_progress_scale=args.idm_spawn_protect_m)
     def pending():
         if balanced:
             return any(min(partitions[k][r] for r in ids) < quota for k, quota in quotas.items())
         return min(counts[r] for r in rare) < args.target
     counts, cutoff = Counter(), Counter()
-    pairs_by_route = Counter()
+    pairs_by_route, observation_counts = Counter(), Counter()
     completed, number = 0, 0
     first_milestone = None
     print(f"Tracking {rare}, target {args.target} each", flush=True)
@@ -213,7 +242,8 @@ def main():
                 if i and i % 20 == 0:
                     validation_runs.add(i + int(split_rng.integers(20)))
                 assignments[i] = "validation" if i in validation_runs else "train"
-            jobs = [pool.submit(collect, suite, cfg, flows, output, i, observation, spec["traffic_vph"], dagger_base)
+            jobs = [pool.submit(collect, suite, cfg, flows, output, i, observation, spec["traffic_vph"],
+                                dagger_base, args.idm_spawn_protect_m)
                     for i in range(number, number + args.workers)]
             number += args.workers
             for job in as_completed(jobs):
@@ -223,11 +253,14 @@ def main():
                 partitions[assignments[report["episode"]]].update(report["trajectories_by_route"])
                 cutoff.update(report["cutoff_by_route"])
                 pairs_by_route.update(report["routes"])
+                observation_counts.update({key: report["counts"].get(key, 0) for key in
+                                           ("observed_samples", "leader_gap_geometry_corrected_samples")})
                 summary = dict(runs=completed, pairs=sum(pairs_by_route.values()),
                                elapsed_seconds=round(monotonic()-started, 2),
                                rare_routes={r: counts[r] for r in rare},
                                trajectories_by_route=dict(counts), pairs_by_route=dict(pairs_by_route),
                                cutoff_by_route=dict(cutoff),
+                               observation_counts=dict(observation_counts),
                                partition_counts={key: dict(c) for key, c in partitions.items()})
                 if first_milestone is None and min(counts[r] for r in rare) >= args.target:
                     first_milestone = {k: summary[k] for k in ("runs", "pairs", "elapsed_seconds", "rare_routes")}
@@ -245,11 +278,13 @@ def main():
         select_dataset(output, dataset, ids, assignments, quotas,
                        dict(observation=observation, simulation=mdp["SIMULATION"], traffic=road["TRAFFIC"],
                             collision_detection=spec["collision_detection"],
+                            idm_spawn_protect_m=args.idm_spawn_protect_m,
                             dagger_base=str(dagger_base) if dagger_base else None,
                             rollout_controller="BC" if dagger_base else "IDM", label_controller="IDM"))
         model = output / "training"
         cmd = [sys.executable, "-u", "scripts/train_bc_shards.py", str(dataset),
-               "--out-dir", str(model), "--epochs", str(args.epochs)]
+               "--out-dir", str(model), "--epochs", str(args.epochs),
+               "--lane-weight-root", str(args.lane_weight_root)]
         if dagger_base:
             cmd += ["--init-model", str(dagger_base), "--lr", str(args.finetune_lr)]
         subprocess.run(cmd, check=True)

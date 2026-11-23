@@ -50,13 +50,13 @@ def prepare_road(suite, out, spec):
     return cfg, flows, {flow.route: lane_counts[routes[flow.route][0]] for flow in flows}
 
 
-def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=None):
+def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=None,
+             leader_gap_geometry=None, spawn_protect_m=0.):
     import torch
 
     torch.set_num_threads(1)
     road, _, _ = load_saved_configs(str(suite / "reference/model.pt"))
     _, mdp, train = load_saved_configs(str(model))
-    actor = load_actor(model, train["HPARAMS"], "cpu").eval()
     api = libsumo
     gui = gui_delay is not None
     if gui:
@@ -68,12 +68,16 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=N
         def _api(self):
             return api
 
+    observation = dict(mdp["OBSERVATION"])
+    if leader_gap_geometry is not None:
+        observation["leader_gap_geometry"] = leader_gap_geometry
     env = MixedTrafficObserver(str(cfg), road["ROAD"], road["EGO"], mdp["SIMULATION"],
-                             mdp["OBSERVATION"], mdp["ACTION"], train["REWARD"],
+                             observation, mdp["ACTION"], train["REWARD"],
                              traffic=road["TRAFFIC"])
+    actor = load_actor(model, train["HPARAMS"], "cpu", obs_dim=env.obs_dim).eval()
     env.lc_safety_enabled = False
     env.lc_spawn_protect_only = True
-    env.lc_spawn_protect = 30.0
+    env.lc_spawn_protect = spawn_protect_m
     controllers = road["TRAFFIC"]["controllers"]
     mix = {name: dict(controllers[name], probability=share) if name != "ego"
            else dict(probability=share, speed_dev=0.0) for name, share in MIX.items()}
@@ -210,9 +214,18 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seconds", type=int, default=DEFAULT_SECONDS,
                         help="Simulation duration per seed (default: 3600 simulated seconds)")
+    parser.add_argument("--leader-gap-geometry", action=argparse.BooleanOptionalAction,
+                        help="Override the checkpoint's geometry-based leader gap setting")
+    parser.add_argument("--spawn-protect-m", type=float, default=0.,
+                        help="Initial lane-change restriction in meters (default: 0, disabled)")
     args = parser.parse_args()
+    if not np.isfinite(args.spawn_protect_m) or args.spawn_protect_m < 0:
+        parser.error("--spawn-protect-m must be finite and nonnegative")
     suite, model = args.suite.resolve(strict=True), args.model.resolve(strict=True)
     spec = read_json(suite / "suite.json")
+    _, mdp, _ = load_saved_configs(str(model))
+    geometry = (args.leader_gap_geometry if args.leader_gap_geometry is not None
+                else bool(mdp["OBSERVATION"].get("leader_gap_geometry", False)))
     vph = spec["traffic_vph"] if args.vph is None else args.vph
     if (spec.get("adaptive_traffic") or min(vph, args.workers, args.seconds) < 1
             or min(args.seeds) < 0 or len(set(args.seeds)) != len(args.seeds)):
@@ -225,7 +238,8 @@ def main():
     print(f"{vph:,} vehicles/hour, {len(args.seeds)} seeds, {seconds:,} simulated seconds per seed", flush=True)
     rows, runs = [], []
     with ProcessPoolExecutor(min(args.workers, len(args.seeds)), mp_context=get_context("spawn")) as pool:
-        jobs = [pool.submit(run_road, cfg, flows, lanes, suite, model, vph, seconds, seed)
+        jobs = [pool.submit(run_road, cfg, flows, lanes, suite, model, vph, seconds, seed,
+                            leader_gap_geometry=geometry, spawn_protect_m=args.spawn_protect_m)
                 for seed in args.seeds]
         for job in jobs:
             results, run = job.result()
@@ -243,7 +257,11 @@ def main():
     write_json(out / "evaluation_summary.json",
                dict(checkpoint=str(model), checkpoint_sha256=hashlib.sha256(model.read_bytes()).hexdigest(),
                     suite=str(suite), traffic_vph=vph, requested_type_mix=MIX,
-                    warmup_seconds=0, simulation_seconds=seconds, runs=runs,
+                    warmup_seconds=0, simulation_seconds=seconds, runs=runs, leader_gap_geometry=geometry,
+                    spawn_protect_m=args.spawn_protect_m,
+                    connected_lane_bumper_gaps=bool(mdp["OBSERVATION"].get("connected_lane_bumper_gaps")),
+                    signed_adjacent_gaps=bool(mdp["OBSERVATION"].get("signed_adjacent_gaps")),
+                    spawn_progress_scale=mdp["OBSERVATION"].get("spawn_progress_scale", 0.),
                     overall=overall, by_route={route: summarize(group) for route, group in sorted(by_route.items())}))
     print(f"Overall: {overall} · {out}", flush=True)
 

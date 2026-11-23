@@ -176,10 +176,17 @@ def collect_episode(env, episode, seed, args, directory, extra_routes=None, traf
             allowed = {}
             protect = getattr(args, 'spawn_protect_m', None)
             if protect is not None:
+                protected_type = getattr(args, 'spawn_protect_vehicle_type', None)
                 for vid in libsumo.vehicle.getIDList():
-                    allowed[vid] = lane_change_timing_allowed(
-                        libsumo.vehicle.getRoadID(vid), libsumo.vehicle.getLanePosition(vid),
-                        libsumo.vehicle.getRouteIndex(vid), protect)
+                    edge = libsumo.vehicle.getRoadID(vid)
+                    position = libsumo.vehicle.getLanePosition(vid)
+                    index = libsumo.vehicle.getRouteIndex(vid)
+                    if protected_type is not None:
+                        if libsumo.vehicle.getTypeID(vid) != protected_type:
+                            continue
+                        allowed[vid] = edge.startswith(':') or index != 0 or position >= protect
+                    else:
+                        allowed[vid] = lane_change_timing_allowed(edge, position, index, protect)
                     libsumo.vehicle.setLaneChangeMode(vid, 1621 if allowed[vid] else 0)
             if collecting:
                 collect_ids = libsumo.vehicle.getIDList()
@@ -192,7 +199,11 @@ def collect_episode(env, episode, seed, args, directory, extra_routes=None, traf
                     vehicle_type = libsumo.vehicle.getTypeID(vid)
                     if (included is not None and vehicle_type != included) or vehicle_type in excluded:
                         continue
+                    corrections_before = env.leader_gap_geometry_corrections
                     obs = env.observe_vehicle(vid)
+                    counts['observed_samples'] += 1
+                    counts['leader_gap_geometry_corrected_samples'] += int(
+                        env.leader_gap_geometry_corrections > corrections_before)
                     if obs.shape != (env.obs_dim,) or not np.isfinite(obs).all():
                         raise ValueError(f'Invalid observation for {vid}')
                     rid = libsumo.vehicle.getRouteID(vid)

@@ -26,6 +26,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from env.control_timing import lane_change_timing_allowed
+from env.connected_lane_gaps import ConnectedLaneGaps
 from env.ego_routes import group_unique_ego_routes
 from env.route_guidance import choice_geometry, navigation_observation
 from env.ring_observation import ring_geometry, ring_observation
@@ -202,6 +203,20 @@ class SumoHighwayEnv(gym.Env):
         self.neighbor_distance_mode = mdp_obs.get("neighbor_distance_mode", "legacy")
         if self.neighbor_distance_mode not in ("legacy", "bumper"):
             raise ValueError("neighbor_distance_mode must be legacy or bumper")
+        # SUMO reports a leader gap of 0, never negative, once a leader on the next (junction) lane is
+        # closer than minGap, so the bumper-mode front gap stays at minGap while the cars overlap.
+        # True measures that case from lane geometry instead. Default False keeps earlier runs unchanged.
+        self.leader_gap_geometry = bool(mdp_obs.get("leader_gap_geometry", False))
+        self.leader_gap_geometry_corrections = 0
+        self._connected_lane_gaps = (
+            ConnectedLaneGaps(self.visibility, self._max_neighbor_length,
+                              signed_adjacent=mdp_obs.get("signed_adjacent_gaps", False))
+            if mdp_obs.get("connected_lane_bumper_gaps", False) else None
+        )
+        self.spawn_progress_scale = float(mdp_obs.get("spawn_progress_scale", 0.0))
+        if (not np.isfinite(self.spawn_progress_scale) or self.spawn_progress_scale < 0
+                or (self.spawn_progress_scale > 0 and not self.bc_observation)):
+            raise ValueError("Spawn progress requires a finite positive BC observation scale")
         # 밀도 정규화용 "차량 1대가 점유하는 길이" (차체 + 최소 간격)
         self.density_veh_len = float(mdp_obs.get("density_veh_length", 7.5))
         self.connectivity_half_width = 2 if self.bc_observation else int(mdp_obs.get("connectivity_half_width", 2))
@@ -326,6 +341,10 @@ class SumoHighwayEnv(gym.Env):
                 low = np.concatenate((low, [-np.inf, -np.inf])).astype(np.float32)
                 high = np.concatenate((high, [np.inf, np.inf])).astype(np.float32)
                 self.obs_dim += 2
+            if self.spawn_progress_scale:
+                low = np.append(low, np.float32(0))
+                high = np.append(high, np.float32(1))
+                self.obs_dim += 1
             self.observation_space = spaces.Box(low, high, dtype=np.float32)
 
 
@@ -576,10 +595,27 @@ class SumoHighwayEnv(gym.Env):
         if not vid:
             return None
         if physical and offset == 0:
+            clamped = leader and gap <= 0.05
             gap += self._api.vehicle.getMinGap(self.ego_id if leader else vid)
+            if clamped and getattr(self, "leader_gap_geometry", False):
+                geometric = self._geometric_leader_gap(vid)
+                if geometric is not None and max(geometric, 0) < max(gap, 0):
+                    gap = geometric
+                    self.leader_gap_geometry_corrections = getattr(self, "leader_gap_geometry_corrections", 0) + 1
         if (gap < 0 and not physical) or gap > self.visibility:
             return None
         return float(max(gap, 0) if physical else gap), self._api.vehicle.getSpeed(vid)
+
+    def _geometric_leader_gap(self, leader):
+        """Bumper gap to a leader on the ego lane or on the lane it directly continues into."""
+        vehicle, lanes = self._api.vehicle, self._api.lane
+        own_lane, lead_lane = vehicle.getLaneID(self.ego_id), vehicle.getLaneID(leader)
+        lead_back = vehicle.getLanePosition(leader) - vehicle.getLength(leader)
+        if lead_lane == own_lane:
+            return lead_back - vehicle.getLanePosition(self.ego_id)
+        if any(lead_lane in (link[0], link[4]) for link in lanes.getLinks(own_lane)):
+            return lanes.getLength(own_lane) - vehicle.getLanePosition(self.ego_id) + lead_back
+        return None
 
     def _adjacent_junction_leader(self, offset):
         """Measure the bumper gap along an adjacent lane's internal continuation."""
@@ -1305,12 +1341,21 @@ class SumoHighwayEnv(gym.Env):
         obs = [v / self.vmax]                      # [0] 내 절대속도
 
         # ----- 5개 차선(좌2→좌1→현재→우1→우2)의 선행/후행 상대거리·상대속도 -----
-        for offset in self.obs_offsets:
-            lead = self._neighbor(offset, leader=True, physical=self.neighbor_distance_mode == "bumper")
-            if offset and self.neighbor_distance_mode == "bumper" and self.junction_neighbor_observation:
-                continued = self._adjacent_junction_leader(offset)
-                if continued is not None and (lead is None or continued[0] < lead[0]):
-                    lead = continued
+        connected = self._connected_lane_gaps
+        if connected is not None:
+            neighbors = connected.around(self._api, self.ego_id, self.obs_offsets,
+                                         cache=getattr(self, "_active_ids", None) is not None)
+        else:
+            neighbors = []
+            physical = self.neighbor_distance_mode == "bumper"
+            for offset in self.obs_offsets:
+                lead = self._neighbor(offset, leader=True, physical=physical)
+                if offset and physical and self.junction_neighbor_observation:
+                    continued = self._adjacent_junction_leader(offset)
+                    if continued is not None and (lead is None or continued[0] < lead[0]):
+                        lead = continued
+                neighbors.append((lead, self._neighbor(offset, leader=False, physical=physical)))
+        for lead, foll in neighbors:
             if lead is None:
                 obs += [1.0, 1.0]                  # 없음: 멀고 + 위협 없음
             else:
@@ -1318,7 +1363,6 @@ class SumoHighwayEnv(gym.Env):
                 obs += [gap / self.visibility,
                         float(np.clip((lv - v) / self.vmax, -1.0, 1.0))]
 
-            foll = self._neighbor(offset, leader=False, physical=self.neighbor_distance_mode == "bumper")
             if foll is None:
                 obs += [-1.0, -1.0]                # 없음: 멀고 + 위협 없음
             else:
@@ -1347,8 +1391,15 @@ class SumoHighwayEnv(gym.Env):
             extra = (ring_observation(self._api, self.ego_id, self._ring_geometry, self.vmax,
                                       self.ring_distance_scale, self.ring_visibility)
                      if self.ring_observation_enabled else [])
+            progress = []
+            if self.spawn_progress_scale:
+                vehicle = self._api.vehicle
+                first_edge = (vehicle.getRouteIndex(self.ego_id) == 0
+                              and not vehicle.getRoadID(self.ego_id).startswith(":"))
+                progress = [min(1.0, vehicle.getLanePosition(self.ego_id) / self.spawn_progress_scale)
+                            if first_edge else 1.0]
             return np.concatenate((base, np.asarray(
-                signal + navigation[:8] + extra + navigation[8:], dtype=np.float32)))
+                signal + navigation[:8] + extra + navigation[8:] + progress, dtype=np.float32)))
 
         if self.signal_enabled:
             signals = self._upcoming_signals()

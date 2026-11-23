@@ -23,7 +23,8 @@ def load(path):
         return d['observation'],d['action_raw']
 
 
-def run_pass(model, paths, mean, std, weights, batch_size, optimizer=None, deadline=None):
+def run_pass(model, paths, mean, std, weights, batch_size, optimizer=None, deadline=None,
+             *, yellow_index=None, yellow_weight=1.0):
     total_n=0; squared=0.;ce=0.;denom=0.;conf=np.zeros((3,3),np.int64)
     completed=True
     for path in paths:
@@ -33,7 +34,11 @@ def run_pass(model, paths, mean, std, weights, batch_size, optimizer=None, deadl
         x=(torch.as_tensor(obs,device=mean.device)-mean)/std
         y=torch.as_tensor(act[:,0],device=mean.device)
         z=torch.as_tensor(labels,device=mean.device)
-        result=epoch(model,x,y,z,weights,batch_size,optimizer)
+        accel_weights = None
+        if yellow_index is not None:
+            yellow = torch.as_tensor(obs[:, yellow_index], device=mean.device)
+            accel_weights = 1 + yellow * (yellow_weight - 1)
+        result=epoch(model,x,y,z,weights,batch_size,optimizer,accel_weights=accel_weights)
         n=len(obs);d=float(weights[z].sum().item())
         total_n+=n;squared+=result['accel_mse']*n;ce+=result['lane_ce']*d;denom+=d
         conf+=np.asarray(result['confusion'])
@@ -57,10 +62,22 @@ def main():
     p.add_argument('--init-model', type=Path)
     p.add_argument('--lane-weight-root', type=int, default=2,
                    help='Root of inverse lane class frequency (default: 2)')
+    p.add_argument('--yellow-accel-weight-root', type=int,
+                   help='Apply inverse-frequency weighting to acceleration loss on yellow signal steps')
     a=p.parse_args();torch.set_num_threads(4);torch.manual_seed(a.seed);np.random.seed(a.seed)
     if a.lane_weight_root < 1:
         p.error('--lane-weight-root must be at least 1')
     manifest=json.loads((a.data_dir/'manifest.json').read_text());collection=json.loads((a.data_dir/'config.json').read_text())
+    yellow_index = None
+    yellow_count = 0
+    yellow_weight = 1.0
+    if a.yellow_accel_weight_root is not None:
+        observation = collection['observation']
+        if (a.yellow_accel_weight_root < 1 or observation.get('layout') != 'bc49'
+                or not observation.get('signal_enabled')):
+            p.error('--yellow-accel-weight-root requires a positive root and the BC signal layout')
+        # Speed, five lanes of neighbors, five connectivity flags, five densities, then red and yellow.
+        yellow_index = 1 + 5 * 4 + 5 + 5 + 1
     paths=[a.data_dir/x for x in manifest['shards']];rng=np.random.default_rng(a.seed)
     permutation=rng.permutation(len(paths));nval=max(1,round(.05*len(paths)))
     val_indices=set(manifest.get("validation_indices", map(int, permutation[:nval])));train=[x for i,x in enumerate(paths) if i not in val_indices];val=[x for i,x in enumerate(paths) if i in val_indices]
@@ -71,7 +88,17 @@ def main():
         obs,act=load(path);n=len(obs);local=obs.mean(0,dtype=np.float64);delta=local-mean
         m2+=np.square(obs-local).sum(0)+delta**2*count*n/(count+n)
         mean+=delta*n/(count+n);count+=n;counts+=np.bincount(lane_class(act),minlength=3)
+        if yellow_index is not None:
+            yellow = obs[:, yellow_index]
+            if not np.isin(yellow, [0, 1]).all():
+                raise ValueError('Expected a binary yellow observation')
+            yellow_count += int(yellow.sum())
     if (counts==0).any():raise ValueError(f'Missing lane class: {counts}')
+    if yellow_index is not None:
+        if not 0 < yellow_count < count:
+            raise ValueError('Weighting requires both yellow and non-yellow steps')
+        yellow_weight = ((count - yellow_count) / yellow_count) ** (1 / a.yellow_accel_weight_root)
+        print(f'Yellow acceleration weight: {yellow_weight:.6f} ({yellow_count:,}/{count:,} training steps)', flush=True)
     std=np.sqrt(np.maximum(m2/count,0));std=np.where(std<1e-6,1,std)
     mean=mean.astype(np.float32);std=std.astype(np.float32)
     w = np.power(count / (3 * counts), 1 / a.lane_weight_root)
@@ -95,6 +122,8 @@ def main():
                 validation_samples=manifest['samples']-count,train_episodes=[i for i in range(len(paths)) if i not in val_indices],validation_episodes=sorted(val_indices),
                 lane_class_order=['left','keep','right'],train_lane_counts=counts.tolist(),lane_weights=w.tolist(),
                 lane_weight_root=a.lane_weight_root,
+                yellow_accel_weight_root=a.yellow_accel_weight_root, yellow_accel_weight=yellow_weight,
+                train_yellow_count=yellow_count if yellow_index is not None else None,
                 loss='accel_mse + inverse_frequency_lane_ce',storage='episode_npz_shards',
                 collection_manifest_sha256=hashlib.sha256((a.data_dir/'manifest.json').read_bytes()).hexdigest())
     (a.out_dir/'config.json').write_text(json.dumps(config,indent=2)+'\n');np.savez(a.out_dir/'normalization.npz',mean=mean,std=std)
@@ -108,7 +137,8 @@ def main():
         csvwriter=csv.DictWriter(f,fieldnames=fields);csvwriter.writeheader()
         for e in range(1,a.epochs+1):
             shuffled=[train[i] for i in rng.permutation(len(train))]
-            tr=run_pass(model,shuffled,mt,st,wt,a.batch_size,optimizer,deadline)
+            tr=run_pass(model,shuffled,mt,st,wt,a.batch_size,optimizer,deadline,
+                        yellow_index=yellow_index,yellow_weight=yellow_weight)
             if tr is None:break
             va=run_pass(model,val,mt,st,wt,a.batch_size)
             row=dict(epoch=e,train_loss=tr['loss'],val_loss=va['loss'],**{'val_'+k:va[k] for k in ['accel_mse','lane_ce','lane_macro_f1','left_precision','left_recall','right_precision','right_recall']})
