@@ -312,7 +312,7 @@ class ParallelSumo:
         rng.shuffle(routes)
         return routes
 
-    def _respawn(self, ego, route=None, traffic_vph=None, signal_tick=None, snapshot_tick=None):
+    def _respawn(self, ego, route=None, traffic_vph=None, signal_tick=None, snapshot_tick=None, start_lane=None):
         if ego.present:
             libsumo.vehicle.remove(ego.ego_id)
         if route is None:
@@ -337,6 +337,10 @@ class ParallelSumo:
                 libsumo.trafficlight.setPhase(tls_id, phase)
                 libsumo.trafficlight.setPhaseDuration(tls_id, remaining)
         candidates = self.departures[route]
+        if start_lane is not None:
+            departure = next((candidate for candidate in candidates if candidate[2] == start_lane), None)
+            if departure is None:
+                raise ValueError(f"Unavailable departure lane {start_lane} for {route}")
         if departure is None:
             departure = candidates[ego.lane_random.integers(len(candidates))]
         lane, position, lane_index = departure
@@ -359,7 +363,7 @@ class ParallelSumo:
         ego.present = True
         return ego._get_obs()
 
-    def reset(self, routes=None, *, replica_seeds=None, signal_ticks=None, snapshot_ticks=None):
+    def reset(self, routes=None, *, replica_seeds=None, signal_ticks=None, snapshot_ticks=None, start_lanes=None):
         if routes is None and self.fixed_training_routes:
             routes = self.training_route_assignments(self.num_envs)
         valid_routes = set(self.routes) | ({None} if self.focus is not None else set())
@@ -372,6 +376,8 @@ class ParallelSumo:
             raise ValueError("Expected one valid signal tick per replica")
         if snapshot_ticks is not None and len(snapshot_ticks) != self.num_envs:
             raise ValueError("Expected one snapshot key per replica")
+        if start_lanes is not None and len(start_lanes) != self.num_envs:
+            raise ValueError("Expected one departure lane per replica")
         self._close_simulation()
         if not self.departures:
             self._find_departures()
@@ -445,6 +451,8 @@ class ParallelSumo:
                 route, vph = self.focus.sample(ego.focus_random)
             tick = signal_ticks[index] if signal_ticks is not None else None
             snapshot = {} if snapshot_ticks is None else {"snapshot_tick": snapshot_ticks[index]}
+            if start_lanes is not None:
+                snapshot["start_lane"] = start_lanes[index]
             observations.append(self._respawn(ego, route, traffic_vph=vph, signal_tick=tick, **snapshot))
         return np.stack(observations)
 

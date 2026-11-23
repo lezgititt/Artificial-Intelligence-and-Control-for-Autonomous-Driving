@@ -1,5 +1,6 @@
 """Prepare and evaluate a shared fixed-center, 24-route SUMO benchmark."""
 import argparse
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import closing
 import csv
@@ -312,7 +313,7 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
         cfg_path=suite / "sumo/highway.sumocfg", road=reference["ROAD"], ego=reference["EGO"],
         traffic=reference["TRAFFIC"], mdp_sim=mdp["SIMULATION"], mdp_obs=obs_config,
         action=action, reward=reward), scratch, seed=0, randomize_signals=True,
-        randomize_departures=False, independent_episode_rng=True,
+        randomize_departures=spec.get("all_start_lanes", False), independent_episode_rng=True,
         traffic_curriculum=curriculum, fixed_traffic_vph=traffic_vph,
         traffic_snapshot_path=str(suite / "traffic_states.sqlite"))
     env.prototype.lc_spawn_protect = spawn_protect_m
@@ -348,7 +349,8 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
         obs = env.reset([cases[j]["route"] for j in active.values()],
                         signal_ticks=[cases[j]["tick"] for j in active.values()],
                         snapshot_ticks=[cases[j].get("snapshot_tick", cases[j]["tick"]) for j in active.values()],
-                        replica_seeds=[case_seeds[j] for j in active.values()])
+                        replica_seeds=[case_seeds[j] for j in active.values()],
+                        start_lanes=[cases[j]["start_lane"] for j in active.values()])
         if any(env.egos[i].start_lane != cases[j]["start_lane"] for i, j in active.items()):
             raise RuntimeError("Departure lane differs from the fixed case list")
         while active:
@@ -388,7 +390,7 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
                 ego = env.egos[slot]
                 ego.traffic_random = np.random.default_rng(case_seeds[following].spawn(4)[3])
                 obs[slot] = env._respawn(ego, case["route"], traffic_vph=traffic_vph, signal_tick=case["tick"],
-                                         snapshot_tick=case.get("snapshot_tick"))
+                                         snapshot_tick=case.get("snapshot_tick"), start_lane=case["start_lane"])
                 if ego.start_lane != case["start_lane"]:
                     raise RuntimeError("Refilled case used the wrong departure lane")
         rows = parallel_route_rows(records, env.prototype.visibility, env.prototype.step_length)
@@ -421,20 +423,22 @@ def plot_summary(out, label, rows, summary, routes, model_run):
     bars.invert_yaxis()
     bars.set(xlabel="Share of runs (%)", title="Outcomes by route", xlim=(0, 100))
     bars.legend(loc="lower center", bbox_to_anchor=(.5, 1.04), ncol=3, fontsize=8)
-    counts = {}
-    for row in rows:
-        key = row["route"], row["snapshot_time_s"]
-        counts[key] = counts.get(key, 0) + (row["status"] == "arrival")
-    times = sorted({row["snapshot_time_s"] for row in rows})
-    grid = [[counts.get((route, time), np.nan) for time in times] for route in routes]
-    max_arrivals = summary["conditions"].get("seeds_per_snapshot", summary["conditions"].get("seeds_per_offset", 1))
-    raster = heat.imshow(grid, cmap=plt.get_cmap("YlGn", max_arrivals + 1), vmin=-.5, vmax=max_arrivals+.5,
-                          interpolation="nearest", aspect="auto")
-    ticks = range(0, len(times), max(1, len(times) // 8))
-    heat.set_xticks(list(ticks), [times[i] for i in ticks])
-    heat.set_yticks(range(len(routes)), labels)
-    heat.set(xlabel="Saved simulation time (s)", title="Arrivals by saved state")
-    fig.colorbar(raster, ax=heat, ticks=range(max_arrivals + 1), label=f"Arrivals / {max_arrivals}")
+    if "by_start_lane" in summary:
+        lanes = sorted({int(lane) for group in summary["by_start_lane"].values() for lane in group})
+        grid = [[summary["by_start_lane"][route].get(str(lane), {}).get("success_rate", np.nan)
+                 for lane in lanes] for route in routes]
+        raster = heat.imshow(grid, cmap="YlGn", vmin=0, vmax=1, aspect="auto")
+        for i, row in enumerate(grid):
+            for j, rate in enumerate(row):
+                if np.isfinite(rate):
+                    heat.text(j, i, f"{rate:.0%}", ha="center", va="center",
+                              color="white" if rate > .7 else "black", fontsize=8)
+        heat.set_xticks(range(len(lanes)), lanes)
+        heat.set_yticks(range(len(routes)), labels)
+        heat.set(xlabel="Departure lane (0 = rightmost)", title="Completion rate by route and departure lane")
+        fig.colorbar(raster, ax=heat)
+    else:
+        _plot_snapshot_arrivals(fig, heat, rows, summary, routes, labels)
     clearance = outer[-1].subgridspec(1, 2)
     for i, (reference, title) in enumerate((("stop_line", "Stop line"), ("queued_vehicle", "Stopped leader"))):
         ax = fig.add_subplot(clearance[i])
@@ -449,11 +453,31 @@ def plot_summary(out, label, rows, summary, routes, model_run):
         ax.set_xlim(left=0)
     counts = summary["overall"]["statuses"]
     total = len(rows)
-    headline = f"{label} · {total:,} runs · {summary['conditions']['traffic_vph']:,} veh/h · fixed center · first 30 m protected"
+    conditions = summary["conditions"]
+    departure = "all start lanes" if conditions.get("all_start_lanes") else "fixed center"
+    headline = (f"{label} · {total:,} runs · {conditions['traffic_vph']:,} veh/h · {departure} · "
+                f"entry restriction {conditions['spawn_protect_m']:g} m")
     outcomes = " · ".join(f"{OUTCOMES[s][0]} {counts.get(s, 0):,} ({counts.get(s, 0) / total:.1%})" for s in STATUSES)
     fig.suptitle(f"{headline}\n{outcomes}", fontsize=15)
     fig.savefig(out / "summary.png", dpi=125)
     plt.close(fig)
+
+
+def _plot_snapshot_arrivals(fig, heat, rows, summary, routes, labels):
+    counts = {}
+    for row in rows:
+        key = row["route"], row["snapshot_time_s"]
+        counts[key] = counts.get(key, 0) + (row["status"] == "arrival")
+    times = sorted({row["snapshot_time_s"] for row in rows})
+    grid = [[counts.get((route, time), np.nan) for time in times] for route in routes]
+    max_arrivals = summary["conditions"].get("seeds_per_snapshot", summary["conditions"].get("seeds_per_offset", 1))
+    raster = heat.imshow(grid, cmap=plt.get_cmap("YlGn", max_arrivals + 1), vmin=-.5, vmax=max_arrivals+.5,
+                          interpolation="nearest", aspect="auto")
+    ticks = range(0, len(times), max(1, len(times) // 8))
+    heat.set_xticks(list(ticks), [times[i] for i in ticks])
+    heat.set_yticks(range(len(routes)), labels)
+    heat.set(xlabel="Saved simulation time (s)", title="Arrivals by saved state")
+    fig.colorbar(raster, ax=heat, ticks=range(max_arrivals + 1), label=f"Arrivals / {max_arrivals}")
 
 
 def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, *, output=None,
@@ -507,6 +531,18 @@ def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, 
                    overall=summarize(rows),
                    by_route={route: summarize([r for r in rows if r["route"] == route]) for route in routes},
                    elapsed_seconds=round(perf_counter() - started, 2))
+    if spec.get("all_start_lanes"):
+        by_route_lane = {}
+        for row in rows:
+            by_route_lane.setdefault((row["route"], str(row["start_lane"])), Counter())[row["status"]] += 1
+        summary["by_start_lane"] = {}
+        for (route, lane), counts in by_route_lane.items():
+            episodes = counts.total()
+            summary["by_start_lane"].setdefault(route, {})[lane] = dict(
+                episodes=episodes, statuses=dict(counts), success_rate=counts["arrival"] / episodes)
+        center_rows = [row for row in rows if row["start_lane"] == spec["center_lanes"][row["route"]]]
+        if center_rows:
+            summary["center_lane_subset"] = summarize(center_rows)
     if trace_failures_from is not None:
         with (trace_failures_from / 'route_evaluation.csv').open(newline='') as file:
             previous = {int(row['case_id']): row for row in csv.DictReader(file)}
