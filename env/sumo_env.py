@@ -104,6 +104,8 @@ class SumoHighwayEnv(gym.Env):
 
         # ----- 도로/차량 설정에서 필요한 값들 -----
         self.vmax = float(road["speed_limit"])   # 속도 정규화 기준
+        self.ego_speed_cap_enabled = True
+        self.ego_internal_lane_changes = False
         self.num_lanes = int(road["num_lanes"])
         # 시작 차선: "center"면 중앙 차선(차선수//2)으로 자동 결정.
         #   3차선 → 1번(가운데), 5차선 → 2번. 차선 수를 바꿔도 항상 가운데라
@@ -1530,7 +1532,7 @@ class SumoHighwayEnv(gym.Env):
             return False
         try:
             edge = self._api.vehicle.getRoadID(self.ego_id)
-            if edge.startswith(":"):
+            if edge.startswith(":") and not self.ego_internal_lane_changes:
                 return False
             if lane_change != 0 and edge in self.no_lane_change_edges:
                 return False
@@ -1626,8 +1628,10 @@ class SumoHighwayEnv(gym.Env):
             accel_cmd = (accel_raw * self.max_accel
                          if accel_raw >= 0.0 else accel_raw * self.max_decel)
             dv = accel_cmd * self.step_length
-            self._api.vehicle.setSpeed(
-                self.ego_id, float(np.clip(speed_before + dv, 0.0, self.vmax)))
+            target_speed = max(0.0, speed_before + dv)
+            if self.ego_speed_cap_enabled:
+                target_speed = min(target_speed, self.vmax)
+            self._api.vehicle.setSpeed(self.ego_id, target_speed)
 
             if lane_change and self.rw.get("early_lane_change_bonus", 0.0) > 0.0:
                 early_lane_context = self._early_lane_change_context()

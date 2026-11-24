@@ -51,7 +51,8 @@ def prepare_road(suite, out, spec):
 
 
 def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=None,
-             leader_gap_geometry=None, spawn_protect_m=0.):
+             leader_gap_geometry=None, spawn_protect_m=0., ego_speed_cap=True,
+             unrestricted_ego=False):
     import torch
 
     torch.set_num_threads(1)
@@ -76,8 +77,10 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=N
                              traffic=road["TRAFFIC"])
     actor = load_actor(model, train["HPARAMS"], "cpu", obs_dim=env.obs_dim).eval()
     env.lc_safety_enabled = False
-    env.lc_spawn_protect_only = True
+    env.lc_spawn_protect_only = not unrestricted_ego
     env.lc_spawn_protect = spawn_protect_m
+    env.ego_speed_cap_enabled = ego_speed_cap and not unrestricted_ego
+    env.ego_internal_lane_changes = unrestricted_ego
     controllers = road["TRAFFIC"]["controllers"]
     mix = {name: dict(controllers[name], probability=share) if name != "ego"
            else dict(probability=share, speed_dev=0.0) for name, share in MIX.items()}
@@ -93,6 +96,10 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=N
     remaining = (signal_ends[phase] - signal_tick) * env.step_length
     pending, active, rows = {}, {}, []
     requests, departures = Counter(), Counter()
+    observed_failures = defaultdict(set)
+    arrivals_with_failures = 0
+    peak_ego_speed_mps = 0.0
+    ego_steps_above_speed_limit = 0
     steps = round(seconds / env.step_length)
     if not np.isclose(steps * env.step_length, seconds):
         raise ValueError("Simulation duration must be a multiple of the SUMO step length")
@@ -101,11 +108,13 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=N
         if not gui:
             rows.append(dict(seed=seed, vehicle=vid, route=entry["route"],
                              request_s=entry["request_s"], departure_s=entry.get("departure_s"),
-                             start_lane=entry.get("start_lane"), end_s=now, status=status))
+                             start_lane=entry.get("start_lane"), end_s=now, status=status,
+                             observed_failures=",".join(sorted(entry.get("observed_failures", ())))))
 
     command = ["sumo-gui" if gui else "sumo", "-c", str(cfg), "--step-length", str(env.step_length),
                "--seed", str(seed), "--no-step-log", "true", "--no-warnings", "true",
-               "--collision.action", "remove", "--max-depart-delay", str(MAX_DEPART_DELAY)]
+               "--collision.action", "warn" if unrestricted_ego else "remove",
+               "--max-depart-delay", "-1" if unrestricted_ego else str(MAX_DEPART_DELAY)]
     if gui:
         command += ["--start", "--delay", str(gui_delay), "--quit-on-end"]
     api.start(command)
@@ -151,6 +160,10 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=N
                     departures[api.vehicle.getTypeID(vid)] += 1
             for vid, entry in list(active.items()):
                 env.ego_id = vid
+                if not gui and vid in live:
+                    speed = api.vehicle.getSpeed(vid)
+                    peak_ego_speed_mps = max(peak_ego_speed_mps, speed)
+                    ego_steps_above_speed_limit += speed > env.vmax + 1e-6
                 status = None
                 if vid in before and vid in live:
                     signals, _, distance = before[vid][6:9]
@@ -159,7 +172,29 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=N
                         if any(traveled > stop + 1e-6 and env._crossing_signal_color(tls, link, color) == "r"
                                for tls, link, stop, color in signals):
                             status = "red_light"
-                if status is None:
+                if unrestricted_ego:
+                    failures = entry.setdefault("observed_failures", set())
+                    if status == "red_light":
+                        failures.add(status)
+                    if vid in collided:
+                        failures.add("collision")
+                    if vid in live and env._stuck_in_wrong_lane():
+                        failures.add("wrong_lane")
+                    if now - entry["departure_s"] >= MAX_TRIP_SECONDS:
+                        failures.add("timeout")
+                    for failure in failures:
+                        observed_failures[failure].add(vid)
+                    if vid in arrived:
+                        status = "arrival"
+                        arrivals_with_failures += bool(failures)
+                    elif vid in teleported:
+                        # SUMO manages the vehicle during teleportation.
+                        status = "teleport"
+                    elif vid not in live:
+                        status = "removed"
+                    else:
+                        status = None
+                elif status is None:
                     if vid in collided:
                         status = "collision"
                     elif vid in arrived:
@@ -175,10 +210,10 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=N
                 if status:
                     record(vid, entry, status, now)
                     del active[vid]
-                    if vid in live or vid in teleported:
+                    if not unrestricted_ego and (vid in live or vid in teleported):
                         api.vehicle.remove(vid)
             for vid, entry in list(pending.items()):
-                if now - entry["request_s"] > MAX_DEPART_DELAY + 2 * env.step_length:
+                if not unrestricted_ego and now - entry["request_s"] > MAX_DEPART_DELAY + 2 * env.step_length:
                     record(vid, entry, "not_inserted", now)
                     del pending[vid]
             schedule.ids.clear()
@@ -191,6 +226,10 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=N
     if len(rows) + len(active) + len(pending) != requests[EGO_TYPE]:
         raise RuntimeError(f"Seed {seed}: incomplete ego accounting")
     return rows, dict(seed=seed, signal_offset_s=signal_tick * env.step_length,
+                      peak_ego_speed_mps=peak_ego_speed_mps,
+                      ego_steps_above_speed_limit=ego_steps_above_speed_limit,
+                      observed_failure_vehicles={name: len(ids) for name, ids in observed_failures.items()},
+                      arrivals_with_failures=arrivals_with_failures,
                       requests=dict(requests), departures_during_window=dict(departures),
                       excluded_at_cutoff=dict(driving=len(active), awaiting_insertion=len(pending)),
                       outcomes=summarize(rows))
@@ -218,6 +257,10 @@ def main():
                         help="Override the checkpoint's geometry-based leader gap setting")
     parser.add_argument("--spawn-protect-m", type=float, default=0.,
                         help="Initial lane-change restriction in meters (default: 0, disabled)")
+    parser.add_argument("--ego-speed-cap", action=argparse.BooleanOptionalAction, default=True,
+                        help="Cap ego speed commands at the configured road speed (default: enabled)")
+    parser.add_argument("--unrestricted-ego", action="store_true",
+                        help="Allow internal lane changes and log failures without early removal")
     args = parser.parse_args()
     if not np.isfinite(args.spawn_protect_m) or args.spawn_protect_m < 0:
         parser.error("--spawn-protect-m must be finite and nonnegative")
@@ -239,7 +282,8 @@ def main():
     rows, runs = [], []
     with ProcessPoolExecutor(min(args.workers, len(args.seeds)), mp_context=get_context("spawn")) as pool:
         jobs = [pool.submit(run_road, cfg, flows, lanes, suite, model, vph, seconds, seed,
-                            leader_gap_geometry=geometry, spawn_protect_m=args.spawn_protect_m)
+                            leader_gap_geometry=geometry, spawn_protect_m=args.spawn_protect_m,
+                            ego_speed_cap=args.ego_speed_cap, unrestricted_ego=args.unrestricted_ego)
                 for seed in args.seeds]
         for job in jobs:
             results, run = job.result()
@@ -248,17 +292,28 @@ def main():
     by_route = defaultdict(list)
     for row in rows:
         by_route[row["route"]].append(row)
-    fields = ("seed", "vehicle", "route", "request_s", "departure_s", "start_lane", "end_s", "status")
+    fields = ("seed", "vehicle", "route", "request_s", "departure_s", "start_lane", "end_s", "status",
+              "observed_failures")
     with (out / "route_evaluation.csv").open("w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     overall = summarize(rows)
+    if args.unrestricted_ego:
+        driving_at_cutoff = sum(run["excluded_at_cutoff"]["driving"] for run in runs)
+        clean_arrivals = sum(row["status"] == "arrival" and not row["observed_failures"] for row in rows)
+        overall.update(clean_arrivals=clean_arrivals, driving_at_cutoff=driving_at_cutoff,
+                       arrival_rate_including_cutoff=overall["statuses"].get("arrival", 0)
+                       / max(1, overall["inserted"] + driving_at_cutoff),
+                       clean_arrival_rate_including_cutoff=clean_arrivals
+                       / max(1, overall["inserted"] + driving_at_cutoff))
     write_json(out / "evaluation_summary.json",
                dict(checkpoint=str(model), checkpoint_sha256=hashlib.sha256(model.read_bytes()).hexdigest(),
                     suite=str(suite), traffic_vph=vph, requested_type_mix=MIX,
                     warmup_seconds=0, simulation_seconds=seconds, runs=runs, leader_gap_geometry=geometry,
                     spawn_protect_m=args.spawn_protect_m,
+                    ego_speed_cap=args.ego_speed_cap and not args.unrestricted_ego,
+                    unrestricted_ego=args.unrestricted_ego,
                     connected_lane_bumper_gaps=bool(mdp["OBSERVATION"].get("connected_lane_bumper_gaps")),
                     signed_adjacent_gaps=bool(mdp["OBSERVATION"].get("signed_adjacent_gaps")),
                     spawn_progress_scale=mdp["OBSERVATION"].get("spawn_progress_scale", 0.),
