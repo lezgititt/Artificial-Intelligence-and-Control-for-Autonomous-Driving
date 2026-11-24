@@ -438,6 +438,13 @@ class ParallelSumo:
                 (_replica_id(index, tid), link): dict(line, lane_id=_replica_id(index, line["lane_id"]))
                 for (tid, link), line in self.prototype._signal_stop_lines.items()
             }
+            ego._signal_route_movements = {
+                (ego.prefix(incoming), ego.prefix(outgoing)): [
+                    (ego.prefix(tls), link, ego.prefix(lane), lane_index, position)
+                    for tls, link, lane, lane_index, position in movements
+                ]
+                for (incoming, outgoing), movements in self.prototype._signal_route_movements.items()
+            }
             ego.no_lane_change_edges = {_replica_id(index, edge) for edge in ego.no_lane_change_edges}
             self.egos.append(ego)
             route = routes[index] if routes is not None else None
@@ -477,7 +484,8 @@ class ParallelSumo:
         transitions = []
         for ego, (obs, reward, terminated, truncated, info) in zip(
                 self.egos, self._advance(self.egos, actions), strict=True):
-            timeout_obs = obs if truncated and not terminated else None
+            # The BC-to-PPO objective explicitly treats the deadline as a failure.
+            timeout_obs = obs if truncated and not terminated and not ego.rw.get("bc_ppo_reward") else None
             if terminated or truncated:
                 vph = self.fixed_traffic_vph
                 route = None

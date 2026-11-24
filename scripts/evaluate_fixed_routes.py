@@ -22,6 +22,7 @@ from algorithms.ppo import PPO
 from env import road_builder
 from env.adaptive_traffic_schedule import AdaptiveTrafficSchedule, adaptive_schedule_factory
 from env.background_demand import CALIBRATED_VPH, set_weighted_od_flow_rates
+from env.bc_ppo_reward import STOP_AMPLITUDE, STOP_SIGMA_M, STEP_REWARD, TERMINAL_REWARDS, StopRewardProbe
 from env.collision_detection import configure_collision_gaps
 from env.control_timing import lane_change_timing_allowed
 from env.ego_routes import read_ego_route_groups
@@ -295,7 +296,8 @@ def audit_state(ego, reference_signals=()):
                 reference_signal_states=signal_states)
 
 
-def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace_ids, spawn_protect_m):
+def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace_ids, spawn_protect_m,
+                    probe_ppo_reward=False):
     import torch
 
     torch.set_num_threads(1)
@@ -341,6 +343,8 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
     active = {slot: next(queue) for slot in range(env.num_envs)}
     completed = 0
     adaptive_requests = {}
+    probes = [StopRewardProbe() for _ in cases] if probe_ppo_reward else None
+    episode_steps = {}
     trace_ids = set(trace_ids)
     trace_file = None
     try:
@@ -373,8 +377,12 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
                         flags={key: info.get(key) for key in ('arrived', 'collided', 'wrong_lane', 'red_light_violation')})) + '\n')
                 records.record(index, reward, truncated, info)
                 if not (terminated or truncated):
+                    if probes is not None:
+                        probes[index].observe(env.egos[slot], info)
                     obs[slot] = x
                     continue
+                if probes is not None:
+                    episode_steps[index] = env.egos[slot].step_count
                 if env.adaptive_factory:
                     adaptive_requests[index] = {key: info[key] for key in
                                                 ("background_requests", "uniform_idm_requests")}
@@ -395,6 +403,7 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
                     raise RuntimeError("Refilled case used the wrong departure lane")
         rows = parallel_route_rows(records, env.prototype.visibility, env.prototype.step_length)
         return [case | row | adaptive_requests.get(i, {})
+                | (probes[i].result(row["status"], episode_steps[i]) if probes is not None else {})
                 for i, (case, row) in enumerate(zip(cases, rows, strict=True))]
     finally:
         if trace_file is not None:
@@ -481,7 +490,7 @@ def _plot_snapshot_arrivals(fig, heat, rows, summary, routes, labels):
 
 
 def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, *, output=None,
-        spawn_protect_m=0.):
+        spawn_protect_m=0., probe_ppo_reward=False):
     started = perf_counter()
     reference = suite / "reference"
     spec = read_json(suite / "suite.json")
@@ -513,7 +522,8 @@ def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, 
     print(f"{label}: {sum(map(len, shards)):,} cases, {replicas} replicas/worker", flush=True)
     with ProcessPoolExecutor(4, mp_context=get_context("spawn")) as pool:
         futures = [pool.submit(evaluate_worker, suite, context, out / f"worker_{i}",
-                               shard, expert, replicas, trace_ids, spawn_protect_m) for i, shard in enumerate(shards)]
+                               shard, expert, replicas, trace_ids, spawn_protect_m, probe_ppo_reward)
+                   for i, shard in enumerate(shards)]
         rows = sorted((row for job in as_completed(futures) for row in job.result()), key=lambda r: r["case_id"])
     expected = {c["case_id"] for shard in shards for c in shard}
     if len(rows) != len(expected) or {r["case_id"] for r in rows} != expected:
@@ -543,6 +553,18 @@ def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, 
         center_rows = [row for row in rows if row["start_lane"] == spec["center_lanes"][row["route"]]]
         if center_rows:
             summary["center_lane_subset"] = summarize(center_rows)
+    if probe_ppo_reward:
+        stops = [event for row in rows for event in row["probe_stops"]]
+        summary["ppo_reward_probe"] = {
+            "terminal_rewards": TERMINAL_REWARDS, "step_reward": STEP_REWARD,
+            "stop_amplitude": STOP_AMPLITUDE, "stop_sigma_m": STOP_SIGMA_M,
+            "stop_counts": dict(Counter(event["reference"] for event in stops)),
+            "mean_components": {key: float(np.mean([row[key] for row in rows])) for key in
+                                ("probe_terminal_reward", "probe_step_penalty", "probe_stop_reward",
+                                 "probe_total_reward")},
+        }
+        for row in rows:
+            row["probe_stops"] = json.dumps(row["probe_stops"], separators=(",", ":"))
     if trace_failures_from is not None:
         with (trace_failures_from / 'route_evaluation.csv').open(newline='') as file:
             previous = {int(row['case_id']): row for row in csv.DictReader(file)}
@@ -584,6 +606,8 @@ def main():
     evaluate.add_argument("--output", type=Path, help="Override the evaluation output directory")
     evaluate.add_argument("--spawn-protect-m", type=float, default=0.,
                           help="Initial lane-change restriction in meters (default: 0, disabled)")
+    evaluate.add_argument("--probe-ppo-reward", action="store_true",
+                          help="Log proposed PPO reward components without affecting driving")
     evaluate.add_argument("--replicas", type=int, default=MAX_REPLICAS_PER_WORKER,
                           help=f"Replicas per worker (default and maximum: {MAX_REPLICAS_PER_WORKER})")
     evaluate.add_argument("--smoke", type=int, default=0, help="Use only the first N cases per worker")
@@ -611,7 +635,8 @@ def main():
         run(suite, args.label, args.expert, args.model.resolve(strict=True) if args.model else None,
             args.replicas, args.smoke,
             args.trace_failures_from.resolve(strict=True) if args.trace_failures_from else None,
-            output=args.output.resolve() if args.output else None, spawn_protect_m=args.spawn_protect_m)
+            output=args.output.resolve() if args.output else None, spawn_protect_m=args.spawn_protect_m,
+            probe_ppo_reward=args.probe_ppo_reward)
 
 
 if __name__ == "__main__":

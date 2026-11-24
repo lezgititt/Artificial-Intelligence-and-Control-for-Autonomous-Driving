@@ -26,6 +26,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from env.control_timing import lane_change_timing_allowed
+from env.bc_ppo_reward import STEP_REWARD, TERMINAL_REWARDS, StopRewardProbe
 from env.connected_lane_gaps import ConnectedLaneGaps
 from env.ego_routes import group_unique_ego_routes
 from env.route_guidance import choice_geometry, navigation_observation
@@ -251,6 +252,7 @@ class SumoHighwayEnv(gym.Env):
         self._guidance_geometry = {}
         self._signal_stop_offsets = {}
         self._signal_stop_lines = {}
+        self._signal_route_movements = {}
         if self.signal_enabled or self.bc_observation:
             config = ET.parse(cfg_path).getroot()
             net_file = config.find("input/net-file").get("value")
@@ -271,14 +273,18 @@ class SumoHighwayEnv(gym.Env):
                                                      if offset is not None else default)
             for connection in net.findall("connection"):
                 if connection.get("tl") is not None:
+                    incoming, outgoing = connection.get("from"), connection.get("to")
                     key = (connection.get("tl"), int(connection.get("linkIndex")))
-                    lane = connection.get("from") + "_" + connection.get("fromLane")
+                    lane_index = int(connection.get("fromLane"))
+                    lane = f"{incoming}_{lane_index}"
                     self._signal_stop_offsets[key] = lane_offsets.get(lane, 0.0)
                     lane_node = net.find(f"edge/lane[@id='{lane}']")
                     self._signal_stop_lines[key] = {
                         "lane_id": lane,
                         "lane_position": float(lane_node.get("length")) - lane_offsets.get(lane, 0.0),
                     }
+                    movement = (key[0], key[1], lane, lane_index, self._signal_stop_lines[key]["lane_position"])
+                    self._signal_route_movements.setdefault((incoming, outgoing), []).append(movement)
         self.act_dim = int(action["dim"])
         self.accel_index = int(action.get("accel_index", 0))
         self.lane_change_index = int(action.get("lane_change_index", 1))
@@ -486,6 +492,7 @@ class SumoHighwayEnv(gym.Env):
         # ego 경로 고르기 + 시작 차선 정하기
         self.ego_route_id = route_id
         self.step_count = 0
+        self._bc_stop_probe = StopRewardProbe() if self.rw.get("bc_ppo_reward") else None
         self._rewarded_green_signals.clear()
         self._green_stop_since = None
         self._red_safe_zone_since = None
@@ -798,6 +805,13 @@ class SumoHighwayEnv(gym.Env):
         context = self._lane_decision_context()
         if context is not None:
             route, index, target, lanes = context
+            if self.rw.get("bc_ppo_reward"):
+                exit_edge = route[target - 1]
+                exit_pos = self._api.lane.getLength(f"{exit_edge}_0")
+                distance = self._api.vehicle.getDrivingDistance(self.ego_id, exit_edge, exit_pos)
+                if 0 <= distance <= self.rw["early_lane_change_distance_m"]:
+                    return route[index], target, lanes
+                return None
             # Only pay on a preparation road, not at the restrictive exit itself.
             if target >= index + 2:
                 return route[index], target, lanes
@@ -880,7 +894,8 @@ class SumoHighwayEnv(gym.Env):
         best = min(before, self._early_lane_best.get(target, before))
         self._early_lane_best[target] = min(best, after)
         paid = self._early_lane_units_paid.get(target, 0)
-        units = min(max(0, best - after), 3 - paid)
+        limit = 2 if self.rw.get("bc_ppo_reward") else 3
+        units = min(max(0, best - after), limit - paid)
         self._early_lane_units_paid[target] = paid + units
         return units * float(self.rw.get("early_lane_change_bonus", 0.0))
 
@@ -1046,6 +1061,120 @@ class SumoHighwayEnv(gym.Env):
     def _next_signal(self):
         signals = self._upcoming_signals()
         return signals[0] if signals else None
+
+    def get_red_stop_target(self, *, stop_line_gap_m=1.0, queue_gap_m=2.0):
+        """Locate a red approach's target; existence of a target does not imply a signal stop."""
+        if any(not np.isfinite(gap) or gap < 0 for gap in (stop_line_gap_m, queue_gap_m)):
+            raise ValueError("Stop target gaps must be finite and nonnegative")
+        if not self._ego_is_present():
+            return None
+        api = self._api
+        vehicle = api.vehicle
+        route = vehicle.getRoute(self.ego_id)
+        index = vehicle.getRouteIndex(self.ego_id)
+        if index < 0 or vehicle.getRoadID(self.ego_id).startswith(":"):
+            return None
+        own_lane = vehicle.getLaneID(self.ego_id)
+        own_position = vehicle.getLanePosition(self.ego_id)
+        reachable = {own_lane}
+        for incoming, outgoing in zip(route[index:], route[index+1:]):
+            movements = self._signal_route_movements.get((incoming, outgoing))
+            if not movements:
+                reachable = {target for lane in reachable for target in self._route_successor_lanes(lane, outgoing)}
+                continue
+            # Keep the ego's lane when it serves the movement. Otherwise prefer a reachable
+            # approach lane, breaking ties by lateral distance from the current lane index.
+            own_index = vehicle.getLaneIndex(self.ego_id)
+            observed_links = {(tid, link) for tid, link, _, _ in vehicle.getNextTLS(self.ego_id)}
+            tls, link, lane, lane_index, stop_position = min(
+                movements, key=lambda item: (item[2] != own_lane, item[2] not in reachable,
+                                             (item[0], item[1]) not in observed_links,
+                                             abs(item[3] - own_index), item[3], item[1]))
+            if self._crossing_signal_color(tls, link, "") != "r":
+                return None
+            on_approach = incoming == route[index]
+            if on_approach and own_position >= stop_position:
+                return None
+            lower = own_position if on_approach else -np.inf
+            vehicles_ahead = [
+                (position, vid) for vid in api.lane.getLastStepVehicleIDs(lane)
+                if vid != self.ego_id and vehicle.getLaneID(vid) == lane
+                and lower <= (position := vehicle.getLanePosition(vid)) <= stop_position
+            ]
+            leader = None
+            reference = "stop_line"
+            target = stop_position - stop_line_gap_m
+            if vehicles_ahead:
+                position, leader = min(vehicles_ahead)
+                if vehicle.getSpeed(leader) > 0.5:
+                    return None
+                reference = "queued_vehicle"
+                target = position - vehicle.getLength(leader) - queue_gap_m
+            if target < 0:
+                return None
+            return {
+                "tls_id": tls, "link_index": link, "lane_id": lane, "lane_position": target,
+                "xy": tuple(api.simulation.convert2D(incoming, target, lane_index)),
+                "reference": reference, "leader_id": leader, "on_target_lane": lane == own_lane,
+                "stop_line_position": stop_position,
+            }
+        return None
+
+    def get_qualified_red_stop(self, *, lane_change_pending, max_stop_line_gap_m=4.,
+                               max_queue_gap_m=5., max_stop_speed_mps=0.1):
+        """Return a stop target only when the observed stop is consistent with a red-light queue."""
+        if lane_change_pending or not self._ego_is_present():
+            return None
+        api = self._api
+        vehicle = api.vehicle
+        if vehicle.getSpeed(self.ego_id) > max_stop_speed_mps:
+            return None
+        target = self.get_red_stop_target()
+        if target is None or not target["on_target_lane"]:
+            return None
+
+        lane = target["lane_id"]
+        stop_line = target["stop_line_position"]
+        ego_position = vehicle.getLanePosition(self.ego_id)
+        queue = []
+        for vid in api.lane.getLastStepVehicleIDs(lane):
+            if vid == self.ego_id or vehicle.getLaneID(vid) != lane:
+                continue
+            position = vehicle.getLanePosition(vid)
+            if position < ego_position:
+                continue
+            rear = position - vehicle.getLength(vid)
+            if rear < stop_line < position:
+                # A vehicle over the line must not be treated as an empty stop line.
+                return None
+            if position <= stop_line:
+                queue.append((position, rear, vid))
+        leader = vehicle.getLeader(self.ego_id, max_stop_line_gap_m + max_queue_gap_m)
+        if leader and leader[0] and vehicle.getLaneID(leader[0]) != lane:
+            lead_lane = vehicle.getLaneID(leader[0])
+            if any(lead_lane == (link[4] or link[0]) for link in api.lane.getLinks(lane)):
+                gap = self._geometric_leader_gap(leader[0])
+                if gap is not None and ego_position + gap < stop_line:
+                    return None
+        previous_front = ego_position
+        for position, rear, vid in sorted(queue):
+            gap = rear - previous_front
+            if not 0 <= gap <= max_queue_gap_m or vehicle.getSpeed(vid) > max_stop_speed_mps:
+                return None
+            route = vehicle.getRoute(vid)
+            index = vehicle.getRouteIndex(vid)
+            if not 0 <= index < len(route) - 1:
+                return None
+            movements = self._signal_route_movements.get((route[index], route[index + 1]), ())
+            observed = {(tls, link) for tls, link, _, _ in vehicle.getNextTLS(vid)}
+            if not any(candidate_lane == lane and (tls, link) in observed
+                       and self._crossing_signal_color(tls, link, "") == "r"
+                       for tls, link, candidate_lane, _, _ in movements):
+                return None
+            previous_front = position
+        if not 0 <= stop_line - previous_front <= max_stop_line_gap_m:
+            return None
+        return target
 
     def get_stop_clearance(self):
         """Front-bumper clearance at a stop, measured along the road."""
@@ -1635,6 +1764,9 @@ class SumoHighwayEnv(gym.Env):
 
             if lane_change and self.rw.get("early_lane_change_bonus", 0.0) > 0.0:
                 early_lane_context = self._early_lane_change_context()
+                if (early_lane_context is not None and self.rw.get("bc_ppo_reward")
+                        and not self._lane_change_is_safe(lane_change)):
+                    early_lane_context = None
             lane_change_applied = self._apply_lane_change(lane_change)
 
         # 이동 전에 통과 여부를 검사할 정지선과 제어 연결을 기록한다.
@@ -1836,6 +1968,20 @@ class SumoHighwayEnv(gym.Env):
             "lane_before": lane_before,
             "lane_after": lane_after,
         }
+        if self.rw.get("bc_ppo_reward"):
+            reward = STEP_REWARD
+            if collided:
+                reward += TERMINAL_REWARDS["collision"]
+            elif red_light_violation:
+                reward += TERMINAL_REWARDS["red_light"]
+            elif arrived:
+                reward += TERMINAL_REWARDS["arrival"]
+            elif terminated:
+                reward += TERMINAL_REWARDS["wrong_lane"]
+            elif truncated:
+                reward += TERMINAL_REWARDS["timeout"]
+            else:
+                reward += self._bc_stop_probe.observe(self, info) + early_lane_change_reward
         return obs, float(reward), terminated, truncated, info
 
     # ==================================================================

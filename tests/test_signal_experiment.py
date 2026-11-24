@@ -90,6 +90,86 @@ class SignalExperimentTests(unittest.TestCase):
         self.assertEqual(set(traci.vehicle.getIDList()), {"ego"})
         self.assertFalse(ET.parse(os.path.join(self.tmp.name, "highway.rou.xml")).getroot().findall("flow"))
 
+    def test_red_stop_target_uses_route_lane_and_idm_clearances(self):
+        self.place(20, "r")
+        stop_line = self.length - self.offset
+        target = self.env.get_red_stop_target()
+        self.assertEqual(target["lane_id"], self.lane)
+        self.assertEqual(target["reference"], "stop_line")
+        self.assertTrue(target["on_target_lane"])
+        self.assertAlmostEqual(target["lane_position"], stop_line - 1)
+        np.testing.assert_allclose(target["xy"], traci.simulation.convert2D(
+            "A1_in", stop_line - 1, int(self.lane.rsplit("_", 1)[1])))
+
+        traci.vehicle.add("queue_leader", traci.vehicle.getRouteID("ego"), typeID="ego_type")
+        traci.vehicle.moveTo("queue_leader", self.lane, stop_line - 1)
+        traci.vehicle.setSpeed("queue_leader", 0)
+        traci.simulationStep()
+        target = self.env.get_red_stop_target()
+        self.assertEqual(target["reference"], "queued_vehicle")
+        self.assertEqual(target["leader_id"], "queue_leader")
+        expected = traci.vehicle.getLanePosition("queue_leader") - traci.vehicle.getLength("queue_leader") - 2
+        self.assertAlmostEqual(target["lane_position"], expected)
+        self.place(20, "G")
+        self.assertIsNone(self.env.get_red_stop_target())
+
+    def test_red_stop_target_identifies_lane_serving_the_route(self):
+        self.place(20, "r")
+        wrong_lane = next(lane for lane in traci.lane.getIDList()
+                          if lane.startswith("A1_in_") and not any(
+                              traci.lane.getEdgeID(link[0]) == "A2_out"
+                              for link in traci.lane.getLinks(lane)))
+        traci.vehicle.moveTo("ego", wrong_lane, traci.lane.getLength(wrong_lane) - self.offset - 20)
+        target = self.env.get_red_stop_target()
+        self.assertFalse(target["on_target_lane"])
+        self.assertTrue(any(traci.lane.getEdgeID(link[0]) == "A2_out"
+                            for link in traci.lane.getLinks(target["lane_id"])))
+        self.assertIsNone(self.env.get_qualified_red_stop(lane_change_pending=False))
+
+    def test_red_stop_qualification_requires_a_stop_and_no_lane_change_request(self):
+        self.place(1, "r", speed=3)
+        self.assertIsNotNone(self.env.get_red_stop_target())
+        self.assertIsNone(self.env.get_qualified_red_stop(lane_change_pending=False))
+        self.place(1, "r")
+        self.assertIsNone(self.env.get_qualified_red_stop(lane_change_pending=True))
+        self.assertEqual(self.env.get_qualified_red_stop(lane_change_pending=False)["reference"], "stop_line")
+        traci.vehicle.setPreviousSpeed("ego", 0.3)
+        self.assertIsNone(self.env.get_qualified_red_stop(lane_change_pending=False))
+        self.place(1, "G")
+        tls, link, _, _ = self.env._next_signal()
+        colors = ["r"] * len(traci.trafficlight.getRedYellowGreenState(tls))
+        colors[link] = "G"
+        traci.trafficlight.setRedYellowGreenState(tls, "".join(colors))
+        self.assertIsNone(self.env.get_red_stop_target())
+        self.assertIsNone(self.env.get_qualified_red_stop(lane_change_pending=False))
+
+    def test_red_stop_qualification_rejects_isolated_stop_before_stop_line(self):
+        stop_line = self.length - self.offset
+        traci.vehicle.add("queue_leader", traci.vehicle.getRouteID("ego"), typeID="ego_type")
+        traci.vehicle.moveTo("queue_leader", self.lane, stop_line - 14)
+        traci.vehicle.setSpeed("queue_leader", 0)
+        leader_length = traci.vehicle.getLength("queue_leader")
+        self.place(14 + leader_length + 2, "r")
+        traci.simulationStep()
+        self.assertEqual(self.env.get_red_stop_target()["reference"], "queued_vehicle")
+        self.assertIsNone(self.env.get_qualified_red_stop(lane_change_pending=False))
+        traci.vehicle.moveTo("queue_leader", self.lane, stop_line - 1)
+        self.place(1 + leader_length + 2, "r")
+        traci.simulationStep()
+        self.assertEqual(self.env.get_qualified_red_stop(lane_change_pending=False)["reference"], "queued_vehicle")
+        traci.vehicle.setPreviousSpeed("queue_leader", 2)
+        self.assertIsNone(self.env.get_qualified_red_stop(lane_change_pending=False))
+
+    def test_red_stop_qualification_rejects_leader_straddling_the_line(self):
+        self.place(3.5, "r")
+        stop_line = self.length - self.offset
+        traci.vehicle.add("straddling", traci.vehicle.getRouteID("ego"), typeID="ego_type")
+        traci.vehicle.moveTo("straddling", self.lane, stop_line + 2)
+        traci.vehicle.setSpeed("straddling", 0)
+        traci.simulationStep()
+        self.assertEqual(self.env.get_red_stop_target()["reference"], "stop_line")
+        self.assertIsNone(self.env.get_qualified_red_stop(lane_change_pending=False))
+
     def test_red_crossing_at_offset_stopline_terminates(self):
         self.place(2, "r", speed=10)
         _, reward, terminated, _, info = self.env.step([1, 0])
