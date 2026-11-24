@@ -10,8 +10,24 @@ TERMINAL_REWARDS = {
     "collision": -2.0,
     "red_light": -2.0,
 }
+# Speeding is penalized only above the lane limit plus this relative margin. It
+# matches the IDM expert's speed spread (speed_dev 0.1), so the expert's own
+# speeds are not penalized.
+OVERSPEED_TOLERANCE = 0.1
 STOP_AMPLITUDE = 0.01
 STOP_SIGMA_M = 1.0
+
+
+def overspeed_penalty(speed_mps, limit_mps, coef, tolerance=OVERSPEED_TOLERANCE):
+    """Per-step penalty proportional to the relative excess over a lane speed limit.
+
+    Returns ``coef * max(0, v - limit * (1 + tolerance)) / limit``: zero at or
+    below the (tolerated) limit and linear above it. This is a reward term,
+    not a cap; the ego's commanded speed is never altered.
+    """
+    if not (coef >= 0 and tolerance >= 0 and limit_mps > 0):
+        raise ValueError("Use a nonnegative coefficient and tolerance and a positive limit")
+    return coef * max(0.0, speed_mps - limit_mps * (1.0 + tolerance)) / limit_mps
 
 
 def stop_reward(error_m, amplitude=STOP_AMPLITUDE, sigma_m=STOP_SIGMA_M):

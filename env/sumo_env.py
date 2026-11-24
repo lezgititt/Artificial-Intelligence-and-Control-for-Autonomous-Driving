@@ -26,7 +26,8 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from env.control_timing import lane_change_timing_allowed
-from env.bc_ppo_reward import STEP_REWARD, TERMINAL_REWARDS, StopRewardProbe
+from env.bc_ppo_reward import (OVERSPEED_TOLERANCE, STEP_REWARD, TERMINAL_REWARDS, StopRewardProbe,
+                                overspeed_penalty)
 from env.connected_lane_gaps import ConnectedLaneGaps
 from env.ego_routes import group_unique_ego_routes
 from env.route_guidance import choice_geometry, navigation_observation
@@ -1687,6 +1688,15 @@ class SumoHighwayEnv(gym.Env):
         except self._api.TraCIException:
             return False
 
+    def _overspeed_penalty(self, speed):
+        """Event-reward speeding term against the current lane's limit; (penalty, limit)."""
+        coef = float(self.rw.get("overspeed_penalty", 0.0))
+        if speed is None or coef == 0.0 or not self._ego_is_present():
+            return 0.0, None
+        lane = self._api.vehicle.getLaneID(self.ego_id)
+        limit = float(self._api.lane.getMaxSpeed(lane))
+        return overspeed_penalty(speed, limit, coef, float(self.rw.get("overspeed_tolerance", OVERSPEED_TOLERANCE))), limit
+
     def disable_ego_rule_barriers(self):
         """Turn off every rule-based restriction on the ego's commands.
 
@@ -1948,8 +1958,12 @@ class SumoHighwayEnv(gym.Env):
             physical_leader = self._neighbor(0, leader=True, physical=True)
             metric_gap = physical_leader[0] if physical_leader is not None else None
 
+        overspeed, lane_speed_limit = (self._overspeed_penalty(ego_speed)
+                                       if self.rw.get("bc_ppo_reward") else (0.0, None))
         info = {
             "route": self.ego_route_id,
+            "overspeed_penalty": overspeed,
+            "lane_speed_limit": lane_speed_limit,
             "collided": collided,
             "arrived": arrived,
             "wrong_lane": wrong_lane,
@@ -1984,7 +1998,7 @@ class SumoHighwayEnv(gym.Env):
             "lane_after": lane_after,
         }
         if self.rw.get("bc_ppo_reward"):
-            reward = STEP_REWARD
+            reward = STEP_REWARD - overspeed
             if collided:
                 reward += TERMINAL_REWARDS["collision"]
             elif red_light_violation:
