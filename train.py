@@ -191,6 +191,7 @@ if __name__ == "__main__":
         traffic=TRAFFIC,
         gui=False,   # 학습은 화면 없이 (수십 배 빠름)
     )
+    env.disable_ego_rule_barriers()   # ego에는 규칙 기반 장치를 두지 않는다
 
     # 4) 경험 버퍼 + 에이전트
     #    버퍼는 메인에서 만들어 에이전트에 "주입"한다 (utils/buffer.py).

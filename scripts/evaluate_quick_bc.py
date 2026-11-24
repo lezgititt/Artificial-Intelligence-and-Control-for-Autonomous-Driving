@@ -99,8 +99,12 @@ def prepare_context(run, context, data_dir=None, *, max_vph=3000):
     with (context / 'mdp_config.py').open('a') as file:
         file.write('\nOBSERVATION = ' + repr(collection['observation']) + '\n')
         file.write('SIMULATION = ' + repr(collection['simulation']) + '\n')
-        file.write("\n# Match expert collection timing constraints in BC execution.\n")
-        file.write("from copy import deepcopy as _copy_action\nACTION = _copy_action(ACTION)\nACTION['lane_change_safety']['spawn_protect'] = " + repr(spawn_protect) + "\n")
+        # The expert's collection timing (spawn_protect) restricted the expert only.
+        # The BC ego runs without any rule-based lane-change restriction.
+        file.write("\n# The ego executes its lane commands without rule-based restrictions.\n")
+        file.write("from copy import deepcopy as _copy_action\nACTION = _copy_action(ACTION)\n"
+                   "ACTION['lane_change_safety'] = dict(ACTION.get('lane_change_safety', {}), "
+                   "enabled=False, spawn_protect_only=False, spawn_protect=0.0)\n")
     with (context / 'train.py').open('a') as file:
         file.write('\nHPARAMS.update(' + repr(dict(hidden_sizes=tuple(config['hidden_sizes']),
                         activation=config['activation'], policy_type='hybrid')) + ')\n')
@@ -108,7 +112,7 @@ def prepare_context(run, context, data_dir=None, *, max_vph=3000):
     curriculum = TrafficCurriculum(max_vph=max_vph, total_vph=True, snapshot_warmup_seconds=250,
                                     ring_reference_vph=reference)
     from dataclasses import asdict
-    saved = dict(evaluation_only=True, bc_spawn_protect_m=spawn_protect, training_algorithm=config['algorithm'],
+    saved = dict(evaluation_only=True, bc_spawn_protect_m=0.0, expert_spawn_protect_m=spawn_protect, training_algorithm=config['algorithm'],
                  traffic_curriculum=asdict(curriculum), randomize_departures=True,
                  independent_episode_rng=True, seed=0)
     (context / 'evaluation_config.json').write_text(json.dumps(saved, indent=2) + '\n')

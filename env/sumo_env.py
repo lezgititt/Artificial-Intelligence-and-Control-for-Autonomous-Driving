@@ -105,8 +105,10 @@ class SumoHighwayEnv(gym.Env):
 
         # ----- 도로/차량 설정에서 필요한 값들 -----
         self.vmax = float(road["speed_limit"])   # 속도 정규화 기준
-        self.ego_speed_cap_enabled = True
-        self.ego_internal_lane_changes = False
+        # ego에는 규칙 기반 장치를 두지 않는다: 속도 상한 없음, 교차로 내부에서도
+        # 차선변경 명령을 그대로 실행. 비교 실험에서만 명시적으로 켠다.
+        self.ego_speed_cap_enabled = False
+        self.ego_internal_lane_changes = True
         self.num_lanes = int(road["num_lanes"])
         # 시작 차선: "center"면 중앙 차선(차선수//2)으로 자동 결정.
         #   3차선 → 1번(가운데), 5차선 → 2번. 차선 수를 바꿔도 항상 가운데라
@@ -125,13 +127,13 @@ class SumoHighwayEnv(gym.Env):
         self.prefill_jitter = float(pf.get("spacing_jitter", 0.3))
         # ---- 차선변경 안전 게이트 설정 (mdp_config.ACTION["lane_change_safety"]) ----
         lcs = (action.get("lane_change_safety") or {})
-        self.lc_safety_enabled = bool(lcs.get("enabled", True))
+        self.lc_safety_enabled = bool(lcs.get("enabled", False))
         self.lc_spawn_protect_only = bool(lcs.get("spawn_protect_only", False))
         self.lc_front_min = float(lcs.get("min_front_gap", 5.0))   # m
         self.lc_rear_min = float(lcs.get("min_rear_gap", 5.0))     # m
         self.lc_front_tau = float(lcs.get("front_tau", 0.3))       # s
         self.lc_rear_tau = float(lcs.get("rear_tau", 0.5))         # s
-        self.lc_spawn_protect = float(lcs.get("spawn_protect", 30.0))  # m
+        self.lc_spawn_protect = float(lcs.get("spawn_protect", 0.0))  # m
         self.lc_horizon = float(lcs.get("approach_horizon", 1.0))       # s
         self.road_length = float(road["length"])
         # ---- 노형오거리(교차로) 모드 설정 ----
@@ -1684,6 +1686,19 @@ class SumoHighwayEnv(gym.Env):
             return True
         except self._api.TraCIException:
             return False
+
+    def disable_ego_rule_barriers(self):
+        """Turn off every rule-based restriction on the ego's commands.
+
+        Saved checkpoints may carry an enabled lane-change gate or entry
+        restriction; evaluation and training call this so that the policy's
+        acceleration and lane commands are executed as issued.
+        """
+        self.lc_safety_enabled = False
+        self.lc_spawn_protect_only = False
+        self.lc_spawn_protect = 0.0
+        self.ego_speed_cap_enabled = False
+        self.ego_internal_lane_changes = True
 
     def get_privileged_state(self) -> dict:
         """POMDP 데이터셋용 simulator-side state.

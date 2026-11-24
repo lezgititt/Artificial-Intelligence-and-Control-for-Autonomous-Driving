@@ -275,6 +275,7 @@ def main():
                             independent_episode_rng=True,
                             traffic_curriculum=curriculum, fixed_training_routes=args.phase == 2,
                             focused_envs=args.focused_envs // args.num_workers)
+    template.prototype.disable_ego_rule_barriers()   # egos are copies of the prototype
     if template.fixed_training_routes:
         (run_dir / "training_routes.json").write_text(
             json.dumps(template.training_route_assignments(args.num_envs), indent=2) + "\n",
