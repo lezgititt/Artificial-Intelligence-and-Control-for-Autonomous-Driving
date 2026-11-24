@@ -160,6 +160,7 @@ if __name__ == "__main__":
         gui=not args.nogui,
         gui_autostart=False,   # ▶(플레이) 버튼을 눌러야 에피소드 시작
     )
+    env.disable_ego_rule_barriers()   # 저장된 설정과 무관하게 규칙 기반 장치 없이 재생
     if args.route:
         # 평가 인스턴스에만 적용한다. 학습 설정과 도로 원본은 변경하지 않는다.
         env._choose_ego_route = lambda: args.route

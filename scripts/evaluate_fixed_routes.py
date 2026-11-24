@@ -316,6 +316,11 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
         randomize_departures=spec.get("all_start_lanes", False), independent_episode_rng=True,
         traffic_curriculum=curriculum, fixed_traffic_vph=traffic_vph,
         traffic_snapshot_path=str(suite / "traffic_states.sqlite"))
+    # The ego executes the policy's commands without rule-based restrictions.
+    env.prototype.disable_ego_rule_barriers()
+    if spawn_protect_m > 0:
+        # Explicit comparison runs only: an entry-zone lane-change ban.
+        env.prototype.lc_spawn_protect_only = True
     env.prototype.lc_spawn_protect = spawn_protect_m
     env.expert_type = expert_type
     env.adaptive_factory = None

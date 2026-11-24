@@ -51,7 +51,7 @@ def prepare_road(suite, out, spec):
 
 
 def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=None,
-             leader_gap_geometry=None, spawn_protect_m=0., ego_speed_cap=True,
+             leader_gap_geometry=None, spawn_protect_m=0., ego_speed_cap=False,
              unrestricted_ego=False):
     import torch
 
@@ -76,11 +76,12 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=N
                              observation, mdp["ACTION"], train["REWARD"],
                              traffic=road["TRAFFIC"])
     actor = load_actor(model, train["HPARAMS"], "cpu", obs_dim=env.obs_dim).eval()
-    env.lc_safety_enabled = False
-    env.lc_spawn_protect_only = not unrestricted_ego
+    # The ego executes the policy's commands without rule-based restrictions.
+    # The speed cap and entry-zone ban exist only as explicit comparison options.
+    env.disable_ego_rule_barriers()
+    env.lc_spawn_protect_only = spawn_protect_m > 0 and not unrestricted_ego
     env.lc_spawn_protect = spawn_protect_m
     env.ego_speed_cap_enabled = ego_speed_cap and not unrestricted_ego
-    env.ego_internal_lane_changes = unrestricted_ego
     controllers = road["TRAFFIC"]["controllers"]
     mix = {name: dict(controllers[name], probability=share) if name != "ego"
            else dict(probability=share, speed_dev=0.0) for name, share in MIX.items()}
@@ -257,10 +258,10 @@ def main():
                         help="Override the checkpoint's geometry-based leader gap setting")
     parser.add_argument("--spawn-protect-m", type=float, default=0.,
                         help="Initial lane-change restriction in meters (default: 0, disabled)")
-    parser.add_argument("--ego-speed-cap", action=argparse.BooleanOptionalAction, default=True,
-                        help="Cap ego speed commands at the configured road speed (default: enabled)")
+    parser.add_argument("--ego-speed-cap", action=argparse.BooleanOptionalAction, default=False,
+                        help="Rule-based comparison only: cap ego speed commands at the road speed (default: off)")
     parser.add_argument("--unrestricted-ego", action="store_true",
-                        help="Allow internal lane changes and log failures without early removal")
+                        help="Log failures without removing the vehicle, so it keeps driving")
     args = parser.parse_args()
     if not np.isfinite(args.spawn_protect_m) or args.spawn_protect_m < 0:
         parser.error("--spawn-protect-m must be finite and nonnegative")
@@ -313,7 +314,8 @@ def main():
                     warmup_seconds=0, simulation_seconds=seconds, runs=runs, leader_gap_geometry=geometry,
                     spawn_protect_m=args.spawn_protect_m,
                     ego_speed_cap=args.ego_speed_cap and not args.unrestricted_ego,
-                    unrestricted_ego=args.unrestricted_ego,
+                    unrestricted_ego=args.unrestricted_ego, ego_lane_change_gate=False,
+                    ego_internal_lane_changes=True,
                     connected_lane_bumper_gaps=bool(mdp["OBSERVATION"].get("connected_lane_bumper_gaps")),
                     signed_adjacent_gaps=bool(mdp["OBSERVATION"].get("signed_adjacent_gaps")),
                     spawn_progress_scale=mdp["OBSERVATION"].get("spawn_progress_scale", 0.),

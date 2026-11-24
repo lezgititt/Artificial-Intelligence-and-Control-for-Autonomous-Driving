@@ -41,9 +41,9 @@ def fixed_start_context(run, context, *args, **kwargs):
         file.write("\nEGO = dict(EGO, depart_lane='center')\n")
     with (context / "mdp_config.py").open("a") as file:
         file.write("\nACTION['lane_change_safety'].update("
-                   "enabled=False, spawn_protect_only=True, spawn_protect=30.0)\n")
+                   "enabled=False, spawn_protect_only=False, spawn_protect=0.0)\n")
     saved.update(randomize_departures=False, fixed_departure="center",
-                 spawn_protect_m=PROTECTED_DISTANCE, target_lane_safety_enabled=False)
+                 spawn_protect_m=0.0, target_lane_safety_enabled=False)
     save_json(context / "evaluation_config.json", saved)
     return saved, curriculum, dataset
 

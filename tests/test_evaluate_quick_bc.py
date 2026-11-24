@@ -51,7 +51,8 @@ class BCQuickEvaluationTests(unittest.TestCase):
             mdp={}
             exec((root/'context/mdp_config.py').read_text(),mdp)
             self.assertEqual(mdp['ACTION']['lane_change_safety']['spawn_protect'],0)
-            self.assertTrue(mdp['ACTION']['lane_change_safety']['enabled'])
+            self.assertFalse(mdp['ACTION']['lane_change_safety']['enabled'])
+            self.assertFalse(mdp['ACTION']['lane_change_safety']['spawn_protect_only'])
             self.assertIn("'spawn_protect':60",(run/'mdp_config.py').read_text())
             self.assertTrue(saved['evaluation_only'])
             self.assertTrue(curriculum.total_vph)
@@ -62,9 +63,11 @@ class BCQuickEvaluationTests(unittest.TestCase):
             updated,_,_=prepare_context(run,root/'aligned_context')
             aligned={}
             exec((root/'aligned_context/mdp_config.py').read_text(),aligned)
-            self.assertEqual(aligned['ACTION']['lane_change_safety']['spawn_protect'],30)
-            self.assertTrue(aligned['ACTION']['lane_change_safety']['enabled'])
-            self.assertEqual(updated['bc_spawn_protect_m'],30)
+            # The expert's entry restriction is recorded but never applied to the BC ego.
+            self.assertEqual(aligned['ACTION']['lane_change_safety']['spawn_protect'],0)
+            self.assertFalse(aligned['ACTION']['lane_change_safety']['enabled'])
+            self.assertEqual(updated['bc_spawn_protect_m'],0)
+            self.assertEqual(updated['expert_spawn_protect_m'],30)
 
     def test_training_panels_use_epoch_and_bc_losses(self):
         with TemporaryDirectory() as directory:

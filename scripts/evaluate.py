@@ -196,6 +196,7 @@ def main():
                            independent_episode_rng=saved.get("independent_episode_rng", False),
                            traffic_curriculum=curriculum,
                            fixed_traffic_vph=vph if curriculum else None)
+        env.prototype.disable_ego_rule_barriers()
         agent = PPO(obs_dim=env.prototype.obs_dim, act_dim=env.prototype.act_dim, **training["HPARAMS"])
         agent.policy.load_state_dict(torch.load(model, map_location="cpu", weights_only=True))
         for seed in SEEDS:
