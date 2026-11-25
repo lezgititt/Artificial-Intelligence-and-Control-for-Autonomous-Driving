@@ -124,7 +124,8 @@ def run_adaptive(sumocfg, flows, routes, args):
                '--max-depart-delay', '125', '--collision.action', 'remove',
                '--no-step-log', 'true', '--no-warnings', 'true']
     if not args.nogui:
-        options += ['--start', '--delay', str(SIMULATION['gui_delay'])]
+        from scripts.make_road_decor import gui_decor_options
+        options += ['--start', '--delay', str(SIMULATION['gui_delay']), *gui_decor_options(sumocfg)]
     started = False
     states = {}
     totals = dict(entered=0, arrived=0, active=0, pending=0, teleports=0, time=0.)
@@ -294,7 +295,8 @@ if __name__ == "__main__":
         print(f"  · 확대: env/mdp_config.py의 gui_zoom={SIMULATION['gui_zoom']}")
         print("  · 속도 조절: 상단 Delay(ms) 값을 조정 (크게 = 느리게)")
         print("  · 종료하려면 창을 닫으세요.")
+        from scripts.make_road_decor import gui_decor_options
         subprocess.run(
-            [checkBinary("sumo-gui"), "-c", sumocfg,
+            [checkBinary("sumo-gui"), "-c", sumocfg, *gui_decor_options(sumocfg),
              "--step-length", str(SIMULATION["step_length"]),
              "--delay", str(SIMULATION["gui_delay"]), *traffic_options])

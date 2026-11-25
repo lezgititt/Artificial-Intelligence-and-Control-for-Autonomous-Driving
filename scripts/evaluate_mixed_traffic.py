@@ -117,7 +117,8 @@ def run_road(cfg, flows, lanes, suite, model, vph, seconds, seed, *, gui_delay=N
                "--collision.action", "warn" if unrestricted_ego else "remove",
                "--max-depart-delay", "-1" if unrestricted_ego else str(MAX_DEPART_DELAY)]
     if gui:
-        command += ["--start", "--delay", str(gui_delay), "--quit-on-end"]
+        from scripts.make_road_decor import gui_decor_options
+        command += ["--start", "--delay", str(gui_delay), "--quit-on-end", *gui_decor_options(cfg)]
     api.start(command)
     try:
         for signal in signal_ids:
