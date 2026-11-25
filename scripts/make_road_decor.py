@@ -10,6 +10,8 @@ evaluation, so it cannot change simulation results.
 Geometry is computed on a 0.5 m grid: the distance from every cell to the nearest
 road surface gives the grass band (closed loops of road are filled, so the empty
 land inside the intersection becomes grass) and the line where trees are planted.
+Lanes closed to all traffic (drawn orange by sumo-gui) are covered with grass,
+together with the junction corners that exist only for them.
 """
 import argparse
 import math
@@ -31,33 +33,61 @@ GRASS_COLOR = "168,196,150"        # same green as the existing traffic islands
 TREE_COLOR = "86,140,82"
 TREE_TOP_COLOR = "112,163,100"
 
-# Lanes are drawn at layer 0; negative layers stay underneath the road.
+# Lanes closed to all traffic (disallow="all") are drawn in orange by sumo-gui.
+# They are covered with grass; the road file itself is left unchanged.
+CLOSED_LANE_GROW = 0.7     # cover grows this much, swallowing thin leftovers (m)
+CLOSED_STUB_REACH = 14.0   # junction area this close to a closed lane is covered (m)
+CLOSED_LANE_GAP = 0.15     # keep the cover this far outside open lanes (m)
+
+# Negative layers stay underneath the road. The closed-lane cover has to be drawn
+# above the black bars sumo-gui puts at lane ends; no vehicle ever drives there,
+# and trees stand at least TREE_OFFSET - TREE_RADIUS away from open lanes.
 BACKGROUND_LAYER = -5
 GRASS_LAYER = -4
-TREE_LAYER = -0.5
+COVER_LAYER = 200
+TREE_LAYER = 201
 
 
-def _road_pieces(net):
-    """Yield (polyline, half width) for every lane and junction outline."""
+def _lane_pieces(net, closed):
+    """(polyline, half width) of lanes open to traffic, or of closed lanes (disallow="all")."""
     for edge in net.getEdges(withInternal=True):
         for lane in edge.getLanes():
-            yield np.asarray(lane.getShape(), float), lane.getWidth() / 2
-    for node in net.getNodes():
-        shape = node.getShape()
-        if len(shape) >= 3:
-            yield np.asarray(list(shape) + [shape[0]], float), 0.0
+            if (not lane.getPermissions()) == closed:
+                yield np.asarray(lane.getShape(), float), lane.getWidth() / 2
 
 
-def _distance_field(net, margin):
-    """Signed-ish distance (m) from each grid cell to the road surface (<= 0 on the road)."""
+def _junction_shapes(net):
+    return [node.getShape() for node in net.getNodes() if len(node.getShape()) >= 3]
+
+
+def _distance_fields(net, margin):
+    """Distances (m) from each grid cell to open lanes, closed lanes and junction areas.
+
+    Each field is <= 0 on its surface. The junction field is negative inside the
+    junction polygons.
+    """
     from matplotlib.path import Path as MplPath
 
     xmin, ymin, xmax, ymax = net.getBoundary()
     xs = np.arange(xmin - margin, xmax + margin + CELL, CELL)
     ys = np.arange(ymin - margin, ymax + margin + CELL, CELL)
+    junctions = _junction_shapes(net)
+    open_lanes = _segment_field(xs, ys, _lane_pieces(net, closed=False))
+    closed_lanes = _segment_field(xs, ys, _lane_pieces(net, closed=True))
+    junction = _segment_field(xs, ys, ((np.asarray(list(s) + [s[0]], float), 0.0) for s in junctions))
+    gx, gy = np.meshgrid(xs, ys)
+    cells = np.column_stack([gx.ravel(), gy.ravel()])
+    for shape in junctions:
+        inside = MplPath(shape).contains_points(cells).reshape(junction.shape)
+        junction[inside] = -np.abs(junction[inside])
+    return xs, ys, open_lanes, closed_lanes, junction
+
+
+def _segment_field(xs, ys, pieces):
+    """Distance from each grid cell to the nearest thick polyline (<= 0 on it)."""
     field = np.full((len(ys), len(xs)), np.inf)
     reach = GRASS_WIDTH + 2.0
-    for line, half in _road_pieces(net):
+    for line, half in pieces:
         for (x0, y0), (x1, y1) in zip(line[:-1], line[1:]):
             lo_x, hi_x = min(x0, x1) - half - reach, max(x0, x1) + half + reach
             lo_y, hi_y = min(y0, y1) - half - reach, max(y0, y1) + half + reach
@@ -71,14 +101,7 @@ def _distance_field(net, margin):
             t = 0.0 if length2 == 0 else np.clip(((gx - x0) * dx + (gy - y0) * dy) / length2, 0, 1)
             dist = np.hypot(gx - (x0 + t * dx), gy - (y0 + t * dy)) - half
             np.minimum(field[j0:j1, i0:i1], dist, out=field[j0:j1, i0:i1])
-    gx, gy = np.meshgrid(xs, ys)
-    cells = np.column_stack([gx.ravel(), gy.ravel()])
-    for node in net.getNodes():
-        shape = node.getShape()
-        if len(shape) >= 3:
-            inside = MplPath(shape).contains_points(cells).reshape(field.shape)
-            field[inside] = np.minimum(field[inside], 0.0)
-    return xs, ys, np.minimum(field, 1e3)
+    return np.minimum(field, 1e3)
 
 
 def _simplify(points, tolerance):
@@ -115,12 +138,12 @@ def _circle(cx, cy, r, n=14):
             for k in range(n)]
 
 
-def _grass_outlines(xs, ys, field):
-    """Outer rings of the grass band; holes (land enclosed by roads) are filled."""
+def _outlines(xs, ys, field, level):
+    """Outer rings of the region field <= level; holes are filled."""
     from contourpy import FillType, contour_generator
 
     gen = contour_generator(xs, ys, field, fill_type=FillType.OuterOffset)
-    points, offsets = gen.filled(-np.inf, GRASS_WIDTH)
+    points, offsets = gen.filled(-np.inf, level)
     outlines = []
     for pts, off in zip(points, offsets):
         outer = pts[off[0]:off[1]]
@@ -158,7 +181,16 @@ def write_decor(net_path, out_path=None):
     net_path = Path(net_path)
     out_path = Path(out_path) if out_path else net_path.with_name("highway.decor.xml")
     net = sumolib.net.readNet(str(net_path), withInternal=True)
-    xs, ys, field = _distance_field(net, GRASS_WIDTH + 4.0)
+    xs, ys, open_lanes, closed_lanes, junction = _distance_fields(net, GRASS_WIDTH + 4.0)
+    # Grass keeps the outline of the whole road layout (closed lanes included), so
+    # the land the closed ring used to enclose stays a single green park.
+    grass = np.minimum(np.minimum(open_lanes, closed_lanes), junction)
+    # Trees line the roads that are actually used.
+    roads = np.minimum(open_lanes, junction)
+    # Hide closed lanes and the junction corners that exist only because of them,
+    # stopping just outside the open lanes so the used road keeps its edge.
+    closed_area = np.minimum(closed_lanes, np.maximum(junction, closed_lanes - CLOSED_STUB_REACH))
+    cover = np.maximum(closed_area - CLOSED_LANE_GROW, CLOSED_LANE_GAP - open_lanes)
     xmin, ymin, xmax, ymax = net.getBoundary()
     cx, cy, e = (xmin + xmax) / 2, (ymin + ymax) / 2, BACKGROUND_EXTENT
 
@@ -166,10 +198,13 @@ def write_decor(net_path, out_path=None):
              "    <!-- Generated by scripts/make_road_decor.py; GUI decoration only. -->",
              f'    <poly id="decor_background" color="{BACKGROUND_COLOR}" fill="1" '
              f'layer="{BACKGROUND_LAYER}" shape="{_fmt([(cx - e, cy - e), (cx + e, cy - e), (cx + e, cy + e), (cx - e, cy + e)])}"/>']
-    for k, outline in enumerate(_grass_outlines(xs, ys, field)):
+    for k, outline in enumerate(_outlines(xs, ys, grass, GRASS_WIDTH)):
         lines.append(f'    <poly id="decor_grass_{k}" color="{GRASS_COLOR}" fill="1" '
                      f'layer="{GRASS_LAYER}" shape="{_fmt(outline)}"/>')
-    for k, (x, y) in enumerate(_tree_spots(net, xs, ys, field)):
+    for k, outline in enumerate(_outlines(xs, ys, cover, 0.0)):
+        lines.append(f'    <poly id="decor_closed_{k}" color="{GRASS_COLOR}" fill="1" '
+                     f'layer="{COVER_LAYER}" shape="{_fmt(outline)}"/>')
+    for k, (x, y) in enumerate(_tree_spots(net, xs, ys, roads)):
         lines.append(f'    <poly id="decor_tree_{k}" color="{TREE_COLOR}" fill="1" '
                      f'layer="{TREE_LAYER}" shape="{_fmt(_circle(x, y, TREE_RADIUS))}"/>')
         lines.append(f'    <poly id="decor_tree_{k}_top" color="{TREE_TOP_COLOR}" fill="1" '
