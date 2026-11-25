@@ -9,21 +9,26 @@ last. The same calibrated demand is then simulated under every plan.
 A plan is a list of stages. A stage names the lanes that get green, as
 (incoming edge, lane indices); None means every lane of that edge. Lanes that are
 green in two consecutive stages stay green through the yellow and all-red between
-them. U-turns only get a permissive green (they yield), as in road_builder.
+them. U-turns only get a permissive green (they yield). The programs come from
+env/signal_plan.py, the same code road_builder uses for the road itself.
 """
 import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-import itertools
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import xml.etree.ElementTree as ET
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from env import signal_plan
+
 TLS = "nC"
 YELLOW, ALL_RED = 3, 2
-# U-turns made at the node before the junction; controlled by the same program.
-UPSTREAM_UTURNS = {"A2": "A2_in1", "A5": "A5_in1"}
+# U-turns made at the node before the junction, controlled by the same program,
+# and the junction exit that feeds the road each one turns into.
+UTURN_EXITS = {"A2_in1": "A2_out", "A5_in1": "A5_out"}
 
 # Clock positions: A1 = 8, A2 = 2, A3 = 5, A4 = 10, A5 = 3 o'clock.
 SEQUENTIAL = [
@@ -53,85 +58,13 @@ PLANS = {
 }
 
 
-def junction_links(net_path):
-    """Signal links of the junction: index -> connection attributes, with the full path through it."""
-    root = ET.parse(net_path).getroot()
-    shape = {lane.get("id"): [tuple(map(float, p.split(","))) for p in lane.get("shape").split()]
-             for lane in root.iter("lane")}
-    following = {f'{c.get("from")}_{c.get("fromLane")}': c.get("via") for c in root.findall("connection")
-                 if c.get("from").startswith(":") and c.get("via")}
-    links = {}
-    for c in root.findall("connection"):
-        if c.get("tl") != TLS:
-            continue
-        path, lane = [], c.get("via")
-        while lane:
-            path += shape[lane]
-            lane = following.get(lane)
-        links[int(c.get("linkIndex"))] = dict(c.attrib, path=path)
-    return links
-
-
-def stage_links(links, lanes):
-    chosen = set()
-    for edge, indices in lanes:
-        found = {i for i, c in links.items() if c["from"] == edge
-                 and (indices is None or int(c["fromLane"]) in indices)}
-        if not found:
-            raise ValueError(f"No signal link for {edge} lanes {indices}")
-        chosen |= found
-    return chosen
-
-
-def green_state(links, green):
-    """'G' for protected green; 'g' (yield) for U-turns and a second stream into the same lane."""
-    state, taken = ["r"] * (max(links) + 1), set()
-    for i in sorted(green):
-        c = links[i]
-        target = (c["to"], c["toLane"])
-        yields = c["dir"] == "t" or c["from"] in UPSTREAM_UTURNS.values() or target in taken
-        state[i] = "g" if yields else "G"
-        if not yields:
-            taken.add(target)
-    return state
-
-
-def program(links, stages, greens):
-    """SUMO tlLogic for the plan: green, yellow and all-red for each stage."""
-    sets = [stage_links(links, lanes) for _, lanes in stages]
-    logic = ET.Element("tlLogic", id=TLS, type="static", programID="compare", offset="0")
-    for k, ((name, _), seconds) in enumerate(zip(stages, greens, strict=True)):
-        state = green_state(links, sets[k])
-        ending = sets[k] - sets[(k + 1) % len(sets)]
-        ET.SubElement(logic, "phase", duration=str(seconds), state="".join(state), name=f"{name}_green")
-        ET.SubElement(logic, "phase", duration=str(YELLOW), name=f"{name}_yellow",
-                      state="".join("y" if i in ending else s for i, s in enumerate(state)))
-        ET.SubElement(logic, "phase", duration=str(ALL_RED), name=f"{name}_clearance",
-                      state="".join("r" if i in ending else s for i, s in enumerate(state)))
-    return logic, sets
-
-
-def _cross(p, q):
-    def side(a, b, c):
-        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-    return any(side(a, b, c) * side(a, b, d) < 0 and side(c, d, a) * side(c, d, b) < 0
-               for a, b in zip(p[:-1], p[1:]) for c, d in zip(q[:-1], q[1:]))
-
-
-def conflicts(links, green):
-    """Pairs of protected greens whose paths cross, merge into one lane, or feed a U-turn's exit."""
-    state = green_state(links, green)
-    found = []
-    for i, j in itertools.combinations(sorted(green), 2):
-        a, b = links[i], links[j]
-        if a["from"] == b["from"] or "g" in (state[i], state[j]):
-            continue
-        if _cross(a["path"], b["path"]) or (a["to"], a["toLane"]) == (b["to"], b["toLane"]):
-            found.append((i, j))
-    for i in green:   # a U-turn must not run while the junction feeds the road it turns into
-        arm = next((arm for arm, edge in UPSTREAM_UTURNS.items() if links[i]["from"] == edge), None)
-        found += [(i, j) for j in green if arm and links[j]["to"] == f"{arm}_out"]
-    return found
+def plan_program(links, name):
+    """Checked SUMO tlLogic of the named plan."""
+    stages, greens = PLANS[name]
+    timed = [(stage, seconds, lanes) for (stage, lanes), seconds in zip(stages, greens, strict=True)]
+    logic, sets = signal_plan.program(links, timed, YELLOW, ALL_RED, UTURN_EXITS, TLS, "compare")
+    signal_plan.check(links, timed, sets, UTURN_EXITS)
+    return logic
 
 
 def simulate(sumo_dir, plan_file, seed, seconds, out):
@@ -162,18 +95,14 @@ def main():
     parser.add_argument("--keep", type=Path, help="Folder to keep the plan files in (default: temporary)")
     args = parser.parse_args()
     sumo_dir = args.sumo_dir.resolve(strict=True)
-    links = junction_links(sumo_dir / "highway.net.xml")
+    links = signal_plan.junction_links(ET.parse(sumo_dir / "highway.net.xml").getroot(), TLS)
 
     with tempfile.TemporaryDirectory(prefix="signal-plans-") as work:
         out = args.keep.resolve() if args.keep else Path(work)
         out.mkdir(parents=True, exist_ok=True)
         files = {}
         for name, (stages, greens) in PLANS.items():
-            logic, sets = program(links, stages, greens)
-            for (stage, _), green in zip(stages, sets):
-                for i, j in conflicts(links, green):
-                    a, b = links[i], links[j]
-                    raise ValueError(f"{name}/{stage}: {a['from']}>{a['to']} conflicts with {b['from']}>{b['to']}")
+            logic = plan_program(links, name)
             ET.indent(logic, space="    ")
             wrapper = ET.Element("additional")
             wrapper.append(logic)

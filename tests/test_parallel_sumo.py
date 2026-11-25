@@ -62,7 +62,8 @@ class ParallelSumoTests(unittest.TestCase):
             env = ParallelSumo(2, kwargs, root / "parallel", seed=0, randomize_signals=True)
             route = "ego_d_A1_A2"
             rngs = [np.random.default_rng(seed) for seed in np.random.SeedSequence(0).spawn(2)]
-            ends = np.cumsum([40, 6, 4] * 5)
+            # Ticks of 0.5 s: 20 s green, 3 s yellow, 2 s all-red; the second stage has 10 s green.
+            ends = np.cumsum([40, 6, 4, 20, 6, 4] + [40, 6, 4] * 3)
 
             def signal_state(index):
                 light = f"r{index}_nC"
@@ -70,7 +71,7 @@ class ParallelSumoTests(unittest.TestCase):
                         libsumo.trafficlight.getNextSwitch(light) - libsumo.simulation.getTime())
 
             def expected(index):
-                offset = rngs[index].integers(250)
+                offset = rngs[index].integers(ends[-1])
                 phase = np.searchsorted(ends, offset, side="right")
                 return phase, (ends[phase] - offset) * .5
 
