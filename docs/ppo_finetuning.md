@@ -11,6 +11,27 @@
 | 무작위 출발 차선 테스트 (시드 52101–52125, 7,050회) | 90.03% | **97.02%** |
 | └ 충돌 / 적신호 위반 / 차선 실패 / 시간 초과 | 186 / 199 / 293 / 25 | 65 / 7 / 130 / 8 |
 | 검증 세트 (시드 62101–62110, 2,820회) | 90.25% | 96.38% |
+| 무작위 출발 차선 테스트, 사례별 새 SUMO(아래 "평가 재현성") | - | 97.06% |
+
+이 문서의 다른 수치는 모두 사례들이 SUMO를 공유하던 이전 평가 방식(`--shared-sumo`)으로 낸 것이다.
+
+## 평가 재현성
+
+이전 평가는 작업자 4개가 각각 SUMO 하나에서 64개 사례를 동시에 돌리고, 끝난 자리에 다음 사례를 채웠다. 같은 설정을 다시 돌리면 결과가 같았지만, 한 사례의 결과가 앞서 돌린 사례와 함께 돌린 사례에 따라 달라졌다. 최종 모델의 실패 210건을 한 건씩 다시 돌리자 52건(25%)이 도착으로 바뀌었다.
+
+원인은 두 가지다.
+
+- **SUMO 난수:** Krauss 배경 차량(`sigma` 0.3)의 무작위 감속은 SUMO 내부 난수를 쓴다. 그 상태가 같은 SUMO 안의 사례들 사이에 이어진다. 저장된 교통 상태를 복원한 직후에는 두 실행이 같다. 한 스텝 뒤에는 Krauss 차량만 달라지고(48대 중 26대), IDM·EIDM·ACC는 같다. 새 배경 차량을 넣을 때 SUMO가 뽑는 값(속도 계수, `departLane="random"`)도 같은 난수를 쓴다.
+- **배치 추론:** 64개 관측을 한 번에 추론하면 1개씩 추론할 때와 가속 명령이 최대 3×10⁻⁶ 다르다. 정책만 1개씩 추론하게 바꿔도 궤적이 2–3스텝 만에 갈라진다.
+
+지금 `scripts/evaluate_diverse_start_lanes.py evaluate`의 기본 방식은 사례마다 SUMO를 새로 시작하고 복제본 1개로 돌리는 것이다.
+
+- 사례마다 SUMO seed를 기본 seed(`--sumo-seed`, 기본 0)와 사례 번호로 정한다(`case_sumo_seed`). 그래서 어느 모델이든 같은 사례에서는 같은 운전자 무작위성에서 출발한다.
+- 사례 순서, 함께 돌린 사례, 작업자 수가 결과를 바꾸지 않는다(`tests/test_isolated_evaluation.py`). 이전 방식은 같은 테스트에서 실패한다.
+- 7,050회가 24개 프로세스에서 약 2분 걸린다(이전 방식은 약 10.6분).
+- 이전 방식은 `--shared-sumo`로 쓸 수 있다. 고정 경로 평가(`scripts/evaluate_fixed_routes.py evaluate`)는 `--isolated`를 줄 때만 새 방식이다.
+
+운전자 무작위성 자체는 남는다. 모든 사례에 같은 SUMO seed를 주고 seed 0과 1로 각각 돌리자 성공률은 97.08%와 96.92%였고, 사례의 1.6%(111건)에서 결과가 달랐다. seed 0의 실패가 seed 1에서도 같은 실패로 나온 비율은 차선 실패 83%, 충돌 66%였고, 적신호 위반과 시간 초과는 대부분 재현되지 않았다. 전체 성공률의 seed 간 차이는 약 0.15%p라, 최종 결정에는 `--sumo-seed`를 2–3개 바꿔 평균하는 편이 낫다.
 
 ## 이전 PPO가 실패한 원인
 
@@ -86,7 +107,9 @@ python -m scripts.finetune_bc_ppo results/BC_20261122_220742_calibrated_4740_sig
 python scripts/evaluate_diverse_start_lanes.py prepare results/eval_fixed_routes_4740_idm_only_speedgain_20261121_013051 \
   results/eval_diverse_start_lanes_4740_validation_20261124 --seeds 62101 62102 62103 62104 62105 62106 62107 62108 62109 62110
 python scripts/evaluate_diverse_start_lanes.py evaluate results/eval_diverse_start_lanes_4740_20261123_172237 \
-  --model results/PPO_overspeed_20261124_c00/eval_runs/iter100/model.pt
+  --model results/PPO_overspeed_20261124_c00/eval_runs/iter100/model.pt \
+  --output results/PPO_overspeed_20261124_c00/eval_runs/iter100/evaluation_diverse_start_lanes_isolated
+# 이전 방식(위 표의 97.02%): --shared-sumo
 python scripts/plot_anchored_ppo.py results/PPO_overspeed_20261124_validation \
   results/PPO_overspeed_20261124_c00 results/PPO_overspeed_20261124_c00s1 results/PPO_overspeed_20261124_c00s2 \
   results/PPO_overspeed_20261124_c02 --labels "c=0 seed 0 (final)" "c=0 seed 1" "c=0 seed 2" "c=0.02 seed 0" \

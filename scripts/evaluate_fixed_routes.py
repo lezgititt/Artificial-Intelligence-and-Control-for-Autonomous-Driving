@@ -8,6 +8,7 @@ from dataclasses import asdict, replace
 import hashlib
 import json
 from multiprocessing import get_context
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -43,6 +44,11 @@ MAX_REPLICAS_PER_WORKER = 64
 SNAPSHOT_TIMES = tuple(range(802, 951, 2))
 EXPERTS = ("car_idm", "car_krauss", "car_eidm", "car_acc")
 STATUSES = ("arrival", "collision", "red_light", "wrong_lane", "timeout")
+MAX_ISOLATED_WORKERS = 24
+
+
+def default_workers():
+    return max(1, min(MAX_ISOLATED_WORKERS, os.cpu_count() or 1))
 
 
 def read_json(path):
@@ -296,11 +302,32 @@ def audit_state(ego, reference_signals=()):
                 reference_signal_states=signal_states)
 
 
+def case_sumo_seed(base_seed, case):
+    """SUMO --seed for an isolated case.
+
+    It depends only on the case, so every model and every run meets the same
+    initial state of SUMO's random driver behaviour (Krauss dawdling,
+    insertion speed factors) on that case.
+    """
+    return int(np.random.SeedSequence([base_seed, case["case_id"]]).generate_state(1)[0] & 0x7FFFFFFF)
+
+
 def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace_ids, spawn_protect_m,
-                    probe_ppo_reward=False):
+                    probe_ppo_reward=False, *, isolated=False, sumo_seed=0):
+    """Evaluate cases in one process.
+
+    Shared mode runs up to `replicas` cases at once in one SUMO and refills
+    finished slots. SUMO's random number state then carries over between
+    cases, so a case's outcome depends on which cases ran before and beside
+    it, and batched policy inference adds ~1e-6 differences. Isolated mode
+    restarts SUMO with `case_sumo_seed` for every case and runs one replica,
+    so each outcome depends only on the case, the policy and `sumo_seed`.
+    """
     import torch
 
     torch.set_num_threads(1)
+    if isolated:
+        replicas = 1
     model = context / "model.pt"
     _, mdp, train = load_saved_configs(str(model))
     reference, _, _ = load_saved_configs(str(suite / "reference/model.pt"))
@@ -355,6 +382,8 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
     try:
         if trace_ids:
             trace_file = (scratch.parent / f'{scratch.name}_trace.jsonl').open('w', encoding='utf-8')
+        if isolated:
+            env.seed = case_sumo_seed(sumo_seed, cases[0])
         obs = env.reset([cases[j]["route"] for j in active.values()],
                         signal_ticks=[cases[j]["tick"] for j in active.values()],
                         snapshot_ticks=[cases[j].get("snapshot_tick", cases[j]["tick"]) for j in active.values()],
@@ -400,10 +429,18 @@ def evaluate_worker(suite, context, scratch, cases, expert_type, replicas, trace
                     continue
                 active[slot] = following
                 case = cases[following]
-                ego = env.egos[slot]
-                ego.traffic_random = np.random.default_rng(case_seeds[following].spawn(4)[3])
-                obs[slot] = env._respawn(ego, case["route"], traffic_vph=traffic_vph, signal_tick=case["tick"],
-                                         snapshot_tick=case.get("snapshot_tick"), start_lane=case["start_lane"])
+                if isolated:
+                    # A fresh SUMO run: nothing left over from the previous case.
+                    env.seed = case_sumo_seed(sumo_seed, case)
+                    obs = env.reset([case["route"]], signal_ticks=[case["tick"]],
+                                    snapshot_ticks=[case.get("snapshot_tick", case["tick"])],
+                                    replica_seeds=[case_seeds[following]], start_lanes=[case["start_lane"]])
+                    ego = env.egos[slot]
+                else:
+                    ego = env.egos[slot]
+                    ego.traffic_random = np.random.default_rng(case_seeds[following].spawn(4)[3])
+                    obs[slot] = env._respawn(ego, case["route"], traffic_vph=traffic_vph, signal_tick=case["tick"],
+                                             snapshot_tick=case.get("snapshot_tick"), start_lane=case["start_lane"])
                 if ego.start_lane != case["start_lane"]:
                     raise RuntimeError("Refilled case used the wrong departure lane")
         rows = parallel_route_rows(records, env.prototype.visibility, env.prototype.step_length)
@@ -495,7 +532,7 @@ def _plot_snapshot_arrivals(fig, heat, rows, summary, routes, labels):
 
 
 def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, *, output=None,
-        spawn_protect_m=0., probe_ppo_reward=False):
+        spawn_protect_m=0., probe_ppo_reward=False, isolated=False, workers=4, sumo_seed=0):
     started = perf_counter()
     reference = suite / "reference"
     spec = read_json(suite / "suite.json")
@@ -520,14 +557,22 @@ def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, 
     shards = [[c for c in cases if c["worker"] == worker] for worker in range(4)]
     if smoke:
         shards = [shard[:smoke] for shard in shards]
+    if isolated:
+        # Cases are independent, so any split over processes gives the same rows.
+        selected = sorted((c for shard in shards for c in shard), key=lambda c: c["case_id"])
+        shards = [selected[i::workers] for i in range(min(workers, len(selected)))]
+        replicas = 1
     trace_ids = []
     if trace_failures_from is not None:
         with (trace_failures_from / 'route_evaluation.csv').open(newline='') as file:
             trace_ids = [int(row['case_id']) for row in csv.DictReader(file) if row['status'] != 'arrival']
-    print(f"{label}: {sum(map(len, shards)):,} cases, {replicas} replicas/worker", flush=True)
-    with ProcessPoolExecutor(4, mp_context=get_context("spawn")) as pool:
+    mode = (f"fresh SUMO per case (SUMO seed {sumo_seed}), {len(shards)} workers" if isolated
+            else f"{replicas} replicas/worker")
+    print(f"{label}: {sum(map(len, shards)):,} cases, {mode}", flush=True)
+    with ProcessPoolExecutor(len(shards), mp_context=get_context("spawn")) as pool:
         futures = [pool.submit(evaluate_worker, suite, context, out / f"worker_{i}",
-                               shard, expert, replicas, trace_ids, spawn_protect_m, probe_ppo_reward)
+                               shard, expert, replicas, trace_ids, spawn_protect_m, probe_ppo_reward,
+                               isolated=isolated, sumo_seed=sumo_seed)
                    for i, shard in enumerate(shards)]
         rows = sorted((row for job in as_completed(futures) for row in job.result()), key=lambda r: r["case_id"])
     expected = {c["case_id"] for shard in shards for c in shard}
@@ -542,7 +587,10 @@ def run(suite, label, expert, model, replicas, smoke, trace_failures_from=None, 
     summary = dict(label=label, expert=expert, checkpoint=str(model) if model else None,
                    checkpoint_sha256=hashlib.sha256(model.read_bytes()).hexdigest() if model else None,
                    evaluated_epoch=evaluated_epoch,
-                   conditions=spec | {"replicas_per_worker": replicas, "spawn_protect_m": spawn_protect_m},
+                   conditions=spec | {"replicas_per_worker": replicas, "spawn_protect_m": spawn_protect_m,
+                                      "case_isolation": "fresh_sumo_per_case" if isolated else "shared_sumo",
+                                      "sumo_seed": sumo_seed if isolated else 0,
+                                      "evaluation_workers": len(shards)},
                    overall=summarize(rows),
                    by_route={route: summarize([r for r in rows if r["route"] == route]) for route in routes},
                    elapsed_seconds=round(perf_counter() - started, 2))
@@ -616,6 +664,12 @@ def main():
     evaluate.add_argument("--replicas", type=int, default=MAX_REPLICAS_PER_WORKER,
                           help=f"Replicas per worker (default and maximum: {MAX_REPLICAS_PER_WORKER})")
     evaluate.add_argument("--smoke", type=int, default=0, help="Use only the first N cases per worker")
+    evaluate.add_argument("--isolated", action="store_true",
+                          help="Run every case in a fresh SUMO (order- and batch-independent outcomes)")
+    evaluate.add_argument("--workers", type=int, default=default_workers(),
+                          help="Processes for --isolated (default: up to 24)")
+    evaluate.add_argument("--sumo-seed", type=int, default=0,
+                          help="Base SUMO seed for --isolated; each case derives its own")
     evaluate.add_argument('--trace-failures-from', type=Path,
                           help='Replay every case in its original order, logging failed case steps from this result directory')
     args = parser.parse_args()
@@ -637,11 +691,14 @@ def main():
             parser.error("--spawn-protect-m must be finite and nonnegative")
         if not 1 <= args.replicas <= MAX_REPLICAS_PER_WORKER or args.smoke < 0:
             parser.error(f"Expected 1–{MAX_REPLICAS_PER_WORKER} replicas and a nonnegative smoke-test count")
+        if args.workers < 1 or args.sumo_seed < 0:
+            parser.error("--workers must be positive and --sumo-seed nonnegative")
         run(suite, args.label, args.expert, args.model.resolve(strict=True) if args.model else None,
             args.replicas, args.smoke,
             args.trace_failures_from.resolve(strict=True) if args.trace_failures_from else None,
             output=args.output.resolve() if args.output else None, spawn_protect_m=args.spawn_protect_m,
-            probe_ppo_reward=args.probe_ppo_reward)
+            probe_ppo_reward=args.probe_ppo_reward, isolated=args.isolated, workers=args.workers,
+            sumo_seed=args.sumo_seed)
 
 
 if __name__ == "__main__":

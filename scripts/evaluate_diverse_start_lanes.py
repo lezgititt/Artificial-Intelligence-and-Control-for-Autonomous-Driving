@@ -17,7 +17,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from env.parallel_sumo import _signal_schedule, libsumo
 from scripts.evaluate_fixed_routes import (
-    FixedTrafficSchedule, MAX_REPLICAS_PER_WORKER, STEP, read_json, run, write_json,
+    FixedTrafficSchedule, MAX_REPLICAS_PER_WORKER, STEP, default_workers, read_json, run, write_json,
 )
 from scripts.evaluate_mixed_traffic import prepare_road
 
@@ -150,7 +150,15 @@ def main():
     evaluate.add_argument("suite", type=Path)
     evaluate.add_argument("--model", type=Path, required=True)
     evaluate.add_argument("--output", type=Path)
-    evaluate.add_argument("--replicas", type=int, default=MAX_REPLICAS_PER_WORKER)
+    evaluate.add_argument("--workers", type=int, default=default_workers(),
+                          help="Processes; each case runs in its own fresh SUMO (default: up to 24)")
+    evaluate.add_argument("--sumo-seed", type=int, default=0,
+                          help="Base SUMO seed; each case derives its own from it")
+    evaluate.add_argument("--shared-sumo", action="store_true",
+                          help="Previous mode: 4 workers run --replicas cases at once in one SUMO. "
+                               "Outcomes then depend on case order and batching.")
+    evaluate.add_argument("--replicas", type=int, default=MAX_REPLICAS_PER_WORKER,
+                          help="Cases per SUMO with --shared-sumo")
     evaluate.add_argument("--smoke", type=int, default=0)
     args = parser.parse_args()
     if args.command == "prepare":
@@ -160,12 +168,17 @@ def main():
     else:
         if not 1 <= args.replicas <= MAX_REPLICAS_PER_WORKER or args.smoke < 0:
             parser.error("Invalid replica or smoke case count")
+        if args.workers < 1 or args.sumo_seed < 0:
+            parser.error("--workers must be positive and --sumo-seed nonnegative")
+        if args.shared_sumo and args.sumo_seed:
+            parser.error("--sumo-seed applies only to the default isolated mode")
         suite = args.suite.resolve(strict=True)
         if not read_json(suite / "suite.json").get("all_start_lanes"):
             parser.error("Prepare a diverse start-lane suite before evaluation")
         model = args.model.resolve(strict=True)
         output = args.output.resolve() if args.output else None
-        run(suite, "diverse_start_lanes", None, model, args.replicas, args.smoke, output=output)
+        run(suite, "diverse_start_lanes", None, model, args.replicas, args.smoke, output=output,
+            isolated=not args.shared_sumo, workers=args.workers, sumo_seed=args.sumo_seed)
 
 
 if __name__ == "__main__":
